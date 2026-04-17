@@ -42,6 +42,24 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
     if (logosAPI) return;
     logosAPI = api;
     qInfo() << "YoloBoardModule: initLogos called";
+
+    // Pre-warm clients and token cache for dependencies so the first
+    // user-initiated call doesn't trigger the token-exchange dance while
+    // our main thread is blocked on an IPC response (deadlock).
+    QTimer::singleShot(0, this, [this]() {
+        qInfo() << "YoloBoardModule: pre-warming zone-sequencer client";
+        m_zoneClient = logosAPI->getClient(kZoneModuleName);
+        // Trigger token exchange with a harmless no-op call
+        if (m_zoneClient) {
+            m_zoneClient->invokeRemoteMethod(kZoneModuleName, "name", {});
+        }
+        qInfo() << "YoloBoardModule: pre-warming storage client";
+        m_storageClient = logosAPI->getClient(kStorageModuleName);
+        if (m_storageClient) {
+            m_storageClient->invokeRemoteMethod(kStorageModuleName, "name", {});
+        }
+        qInfo() << "YoloBoardModule: pre-warming done";
+    });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
