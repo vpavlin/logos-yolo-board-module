@@ -542,33 +542,28 @@ QString YoloBoardModule::publish(const QString& text) {
     m_allMessages[m_ownChannelId].append(pendingMsg);
     emitMessagesChanged(m_ownChannelId);
 
-    // Publish in background thread so IPC doesn't block our caller
-    auto alive = m_alive;
-    QString tx = m_ownChannelId;
-    QtConcurrent::run([this, alive, text, pendingId]() {
-        if (!alive->load()) return;
+    // Defer publish to next event loop iteration on main thread.
+    // QRemoteObjects is thread-bound; calling zoneCall from a background
+    // thread would silently fail.
+    QTimer::singleShot(0, this, [this, text, pendingId]() {
         QString result = zoneCall("publish", {text}).toString();
         bool ok = !result.isEmpty() && !result.startsWith("Error:");
 
-        if (!alive->load()) return;
-        QMetaObject::invokeMethod(this, [this, alive, result, pendingId, ok]() {
-            if (!alive->load()) return;
-            QVariantList& msgs = m_allMessages[m_ownChannelId];
-            for (int i = 0; i < msgs.size(); ++i) {
-                QVariantMap m = msgs[i].toMap();
-                if (m["id"].toString() == pendingId) {
-                    m["pending"] = false;
-                    m["failed"]  = !ok;
-                    if (ok) m["id"] = result;
-                    msgs[i] = m;
-                    break;
-                }
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == pendingId) {
+                m["pending"] = false;
+                m["failed"]  = !ok;
+                if (ok) m["id"] = result;
+                msgs[i] = m;
+                break;
             }
-            emitMessagesChanged(m_ownChannelId);
-            setStatus(ok ? "Published: " + result.left(12) + QStringLiteral("\u2026")
-                         : "Publish failed: " + result);
-            saveCacheForChannel(m_ownChannelId);
-        }, Qt::QueuedConnection);
+        }
+        emitMessagesChanged(m_ownChannelId);
+        setStatus(ok ? "Published: " + result.left(12) + QStringLiteral("\u2026")
+                     : "Publish failed: " + result);
+        saveCacheForChannel(m_ownChannelId);
     });
 
     return pendingId;
@@ -589,9 +584,9 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
     setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
     emitStateChanged();
 
-    auto alive = m_alive;
-    QtConcurrent::run([this, alive, text, expanded, pendingId]() {
-        if (!alive->load()) return;
+    // Run upload as a state machine on the main thread, using QTimer to
+    // schedule each step (manifest poll). All IPC stays on main thread.
+    QTimer::singleShot(0, this, [this, text, expanded, pendingId]() {
         runUpload(text, expanded, pendingId);
     });
 
@@ -618,20 +613,22 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
         if (doc.isObject()) started = doc.object()["success"].toBool();
     }
     if (!started) {
-        QMetaObject::invokeMethod(this, [this]() {
-            m_uploading = false;
-            setStatus("Upload failed");
-            emitStateChanged();
-        }, Qt::QueuedConnection);
+        m_uploading = false;
+        setStatus("Upload failed");
+        emitStateChanged();
         return;
     }
 
-    // Poll manifests for CID (same thread, OK because we're in background)
-    QString foundCid;
-    for (int attempt = 0; attempt < 30 && !m_alive->load() == false; ++attempt) {
-        QThread::msleep(2000);
-        if (!m_alive->load()) return;
+    // Poll manifests for CID via repeating QTimer (each tick on main thread,
+    // so IPC works and other operations interleave between ticks).
+    auto* pollTimer = new QTimer(this);
+    int* attempt = new int(0);
+    pollTimer->setInterval(2000);
+    connect(pollTimer, &QTimer::timeout, this,
+            [this, pollTimer, attempt, text, filePath, fileName, mimeType, fileSize]() {
+        (*attempt)++;
         QString r = storageCall("manifestsJson", {}).toString();
+        QString foundCid;
         QJsonDocument doc = QJsonDocument::fromJson(r.toUtf8());
         if (doc.isObject() && doc.object()["success"].toBool()) {
             QJsonArray arr = doc.object()["value"].toArray();
@@ -643,53 +640,48 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
                 }
             }
         }
-        if (!foundCid.isEmpty()) break;
-    }
 
-    if (foundCid.isEmpty()) {
-        QMetaObject::invokeMethod(this, [this]() {
+        if (!foundCid.isEmpty()) {
+            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+
+            // Cache locally
+            QFile src(filePath);
+            QByteArray fileData;
+            if (src.open(QIODevice::ReadOnly)) fileData = src.readAll();
+            QString cachePath = mediaCachePath(foundCid);
+            if (!cachePath.isEmpty() && !fileData.isEmpty()) {
+                QDir().mkpath(mediaCacheDir());
+                QFile cache(cachePath);
+                if (cache.open(QIODevice::WriteOnly)) cache.write(fileData);
+            }
+            m_mediaPaths[foundCid] = cachePath;
+
+            // Build payload and publish
+            QJsonObject payload;
+            payload["v"] = 1;
+            payload["text"] = text;
+            QJsonArray media;
+            QJsonObject me;
+            me["cid"] = foundCid;
+            me["type"] = mimeType;
+            me["name"] = fileName;
+            me["size"] = fileSize;
+            media.append(me);
+            payload["media"] = media;
+            QString msg = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+            m_uploading = false;
+            setStatus("Uploaded, publishing\u2026");
+            emitStateChanged();
+            publish(msg);
+        } else if (*attempt >= 30) {
+            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
             m_uploading = false;
             setStatus("Upload timed out");
             emitStateChanged();
-        }, Qt::QueuedConnection);
-        return;
-    }
-
-    // Cache locally
-    QFile src(filePath);
-    QByteArray fileData;
-    if (src.open(QIODevice::ReadOnly)) fileData = src.readAll();
-
-    // Build payload and publish
-    QJsonObject payload;
-    payload["v"] = 1;
-    payload["text"] = text;
-    QJsonArray media;
-    QJsonObject me;
-    me["cid"] = foundCid;
-    me["type"] = mimeType;
-    me["name"] = fileName;
-    me["size"] = fileSize;
-    media.append(me);
-    payload["media"] = media;
-    QString msg = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
-
-    // Save to cache
-    QString cachePath = mediaCachePath(foundCid);
-    if (!cachePath.isEmpty() && !fileData.isEmpty()) {
-        QDir().mkpath(mediaCacheDir());
-        QFile cache(cachePath);
-        if (cache.open(QIODevice::WriteOnly)) cache.write(fileData);
-    }
-
-    if (!m_alive->load()) return;
-    QMetaObject::invokeMethod(this, [this, msg, foundCid, cachePath]() {
-        m_uploading = false;
-        m_mediaPaths[foundCid] = cachePath;
-        setStatus("Uploaded, publishing\u2026");
-        emitStateChanged();
-        publish(msg);  // publishes the JSON payload
-    }, Qt::QueuedConnection);
+        }
+    });
+    pollTimer->start();
 }
 
 // ── Public API: media ────────────────────────────────────────────────────────
@@ -714,11 +706,7 @@ void YoloBoardModule::fetch_media(const QString& cid) {
     if (!m_storageReady) return;
 
     m_fetchingMedia.insert(cid);
-    auto alive = m_alive;
-    QtConcurrent::run([this, alive, cid]() {
-        if (!alive->load()) return;
-        runDownload(cid);
-    });
+    QTimer::singleShot(0, this, [this, cid]() { runDownload(cid); });
 }
 
 void YoloBoardModule::runDownload(const QString& cid) {
@@ -728,34 +716,34 @@ void YoloBoardModule::runDownload(const QString& cid) {
     QDir().mkpath(mediaCacheDir());
     storageCall("downloadFileJson", {cid, cachePath, false});
 
-    // Poll for file
-    for (int attempt = 0; attempt < 30; ++attempt) {
-        QThread::msleep(1000);
-        if (!m_alive->load()) return;
+    // Poll for file via QTimer (main thread, IPC-safe)
+    auto* pollTimer = new QTimer(this);
+    int* attempt = new int(0);
+    pollTimer->setInterval(1000);
+    connect(pollTimer, &QTimer::timeout, this,
+            [this, pollTimer, attempt, cid, cachePath]() {
+        (*attempt)++;
         if (QFile::exists(cachePath) && QFileInfo(cachePath).size() > 0) {
-            if (!m_alive->load()) return;
-            QMetaObject::invokeMethod(this, [this, cid, cachePath]() {
-                m_fetchingMedia.remove(cid);
-                m_mediaPaths[cid] = cachePath;
-                emitMediaReady(cid, cachePath);
-                for (const QString& chId : m_channelIds) {
-                    for (const QVariant& v : m_allMessages.value(chId)) {
-                        for (const QVariant& mv : v.toMap()["media"].toList()) {
-                            if (mv.toMap()["cid"].toString() == cid) {
-                                emitMessagesChanged(chId);
-                                return;
-                            }
+            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+            m_fetchingMedia.remove(cid);
+            m_mediaPaths[cid] = cachePath;
+            emitMediaReady(cid, cachePath);
+            for (const QString& chId : m_channelIds) {
+                for (const QVariant& v : m_allMessages.value(chId)) {
+                    for (const QVariant& mv : v.toMap()["media"].toList()) {
+                        if (mv.toMap()["cid"].toString() == cid) {
+                            emitMessagesChanged(chId);
+                            return;
                         }
                     }
                 }
-            }, Qt::QueuedConnection);
-            return;
+            }
+        } else if (*attempt >= 30) {
+            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+            m_fetchingMedia.remove(cid);
         }
-    }
-    if (!m_alive->load()) return;
-    QMetaObject::invokeMethod(this, [this, cid]() {
-        m_fetchingMedia.remove(cid);
-    }, Qt::QueuedConnection);
+    });
+    pollTimer->start();
 }
 
 // ── Control ──────────────────────────────────────────────────────────────────
