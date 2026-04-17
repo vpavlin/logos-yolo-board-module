@@ -444,23 +444,11 @@ QString YoloBoardModule::get_messages(const QString& channelId) {
         obj["timestamp"] = m["timestamp"].toString();
         obj["pending"] = m["pending"].toBool();
         obj["failed"] = m["failed"].toBool();
-        QJsonArray media;
-        for (const QVariant& mv : m["media"].toList()) {
-            QVariantMap mm = mv.toMap();
-            QJsonObject me;
-            me["cid"] = mm["cid"].toString();
-            me["type"] = mm["type"].toString();
-            me["name"] = mm["name"].toString();
-            me["size"] = mm["size"].toInt();
-            arr.append(obj);  // bug? actually append after
-            // skip, see below
-        }
-        // actually build media array properly
         QJsonArray mediaArr;
         for (const QVariant& mv : m["media"].toList()) {
             QVariantMap mm = mv.toMap();
             QJsonObject me;
-            me["cid"] = mm["cid"].toString();
+            me["cid"]  = mm["cid"].toString();
             me["type"] = mm["type"].toString();
             me["name"] = mm["name"].toString();
             me["size"] = mm["size"].toInt();
