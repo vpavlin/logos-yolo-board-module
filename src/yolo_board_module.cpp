@@ -263,17 +263,31 @@ bool YoloBoardModule::loadChannelFromFile() {
 }
 
 void YoloBoardModule::initSequencer() {
-    zoneCall("set_node_url", {m_nodeUrl});
-    zoneCall("set_signing_key", {m_signingKey});
-    zoneCall("set_checkpoint_path", {m_dataDir + "/sequencer.checkpoint"});
+    qInfo() << "YoloBoardModule: initSequencer: set_node_url";
+    QVariant r1 = zoneCall("set_node_url", {m_nodeUrl});
+    qInfo() << "YoloBoardModule: set_node_url result:" << r1;
+
+    qInfo() << "YoloBoardModule: set_signing_key";
+    QVariant r2 = zoneCall("set_signing_key", {m_signingKey});
+    qInfo() << "YoloBoardModule: set_signing_key result:" << r2;
+
+    qInfo() << "YoloBoardModule: set_checkpoint_path";
+    QVariant r3 = zoneCall("set_checkpoint_path", {m_dataDir + "/sequencer.checkpoint"});
+    qInfo() << "YoloBoardModule: set_checkpoint_path result:" << r3;
 
     if (m_ownChannelId.isEmpty()) {
+        qInfo() << "YoloBoardModule: get_channel_id";
         QString chId = zoneCall("get_channel_id").toString();
+        qInfo() << "YoloBoardModule: get_channel_id result:" << chId;
         if (!chId.isEmpty() && !chId.startsWith("Error:"))
             m_ownChannelId = chId;
     }
-    if (!m_ownChannelId.isEmpty())
-        zoneCall("set_channel_id", {m_ownChannelId});
+    if (!m_ownChannelId.isEmpty()) {
+        qInfo() << "YoloBoardModule: set_channel_id";
+        QVariant r5 = zoneCall("set_channel_id", {m_ownChannelId});
+        qInfo() << "YoloBoardModule: set_channel_id result:" << r5;
+    }
+    qInfo() << "YoloBoardModule: initSequencer done";
 }
 
 void YoloBoardModule::initStorage() {
