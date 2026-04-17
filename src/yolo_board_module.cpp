@@ -611,7 +611,7 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
     else if (ext == "webp") mimeType = "image/webp";
     int fileSize = fi.size();
 
-    QString upResult = storageCall("uploadUrl", {filePath, (qlonglong)65536}).toString();
+    QString upResult = storageCall("uploadUrlJson", {filePath, (qlonglong)65536}).toString();
     bool started = false;
     {
         QJsonDocument doc = QJsonDocument::fromJson(upResult.toUtf8());
@@ -631,7 +631,7 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
     for (int attempt = 0; attempt < 30 && !m_alive->load() == false; ++attempt) {
         QThread::msleep(2000);
         if (!m_alive->load()) return;
-        QString r = storageCall("manifests", {}).toString();
+        QString r = storageCall("manifestsJson", {}).toString();
         QJsonDocument doc = QJsonDocument::fromJson(r.toUtf8());
         if (doc.isObject() && doc.object()["success"].toBool()) {
             QJsonArray arr = doc.object()["value"].toArray();
@@ -726,7 +726,7 @@ void YoloBoardModule::runDownload(const QString& cid) {
     if (cachePath.isEmpty()) return;
 
     QDir().mkpath(mediaCacheDir());
-    storageCall("downloadFile", {cid, cachePath, false});
+    storageCall("downloadFileJson", {cid, cachePath, false});
 
     // Poll for file
     for (int attempt = 0; attempt < 30; ++attempt) {
