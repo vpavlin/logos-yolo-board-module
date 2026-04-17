@@ -41,11 +41,19 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 QVariant YoloBoardModule::zoneCall(const QString& method, const QVariantList& args) {
+    qInfo() << "YoloBoardModule::zoneCall" << method << "logosAPI=" << (logosAPI != nullptr);
     if (!m_zoneClient && logosAPI) {
         m_zoneClient = logosAPI->getClient(kZoneModuleName);
+        qInfo() << "YoloBoardModule::zoneCall got client:" << (m_zoneClient != nullptr);
     }
-    if (!m_zoneClient) return {};
-    return m_zoneClient->invokeRemoteMethod(kZoneModuleName, method, args);
+    if (!m_zoneClient) {
+        qWarning() << "YoloBoardModule::zoneCall no client!";
+        return {};
+    }
+    qInfo() << "YoloBoardModule::zoneCall invoking" << method;
+    QVariant r = m_zoneClient->invokeRemoteMethod(kZoneModuleName, method, args);
+    qInfo() << "YoloBoardModule::zoneCall returned for" << method;
+    return r;
 }
 
 QVariant YoloBoardModule::storageCall(const QString& method, const QVariantList& args) {
