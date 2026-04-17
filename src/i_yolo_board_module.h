@@ -45,6 +45,9 @@ public:
     Q_INVOKABLE virtual void reset_checkpoint() = 0;
     Q_INVOKABLE virtual void start_backfill(const QString& channelId) = 0;
     Q_INVOKABLE virtual void stop_backfill(const QString& channelId) = 0;
+
+    // Config persistence (for UI auto-connect)
+    Q_INVOKABLE virtual QString load_saved_config() = 0;  // returns JSON {"dataDir":"","nodeUrl":""}
 };
 #define IYoloBoardModule_iid "org.logos.iyoloboardmodule"
 Q_DECLARE_INTERFACE(IYoloBoardModule, IYoloBoardModule_iid)

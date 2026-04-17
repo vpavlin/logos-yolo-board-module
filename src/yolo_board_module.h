@@ -48,6 +48,7 @@ public:
     Q_INVOKABLE void reset_checkpoint() override;
     Q_INVOKABLE void start_backfill(const QString& channelId) override;
     Q_INVOKABLE void stop_backfill(const QString& channelId) override;
+    Q_INVOKABLE QString load_saved_config() override;
 
 signals:
     void eventResponse(const QString& eventName, const QVariantList& data);

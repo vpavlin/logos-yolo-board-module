@@ -17,6 +17,12 @@
 const char* YoloBoardModule::kZoneModuleName = "liblogos_zone_sequencer_module";
 const char* YoloBoardModule::kStorageModuleName = "storage_module";
 
+static QString uiConfigPath() {
+    QString dir = QDir::homePath() + "/.config/logos";
+    QDir().mkpath(dir);
+    return dir + "/yolo_board.json";
+}
+
 // ── Constructor / Destructor ─────────────────────────────────────────────────
 
 YoloBoardModule::YoloBoardModule() {
@@ -333,6 +339,16 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 
     m_connected = true;
     setStatus("Connected to " + m_nodeUrl);
+
+    // Save config for next launch
+    {
+        QJsonObject cfg;
+        cfg["dataDir"] = m_dataDir;
+        cfg["nodeUrl"] = m_nodeUrl;
+        QFile f(uiConfigPath());
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+    }
 
     m_pollTimer->start();
 
@@ -935,4 +951,12 @@ void YoloBoardModule::emitStatusChanged() {
 
 void YoloBoardModule::emitMediaReady(const QString& cid, const QString& path) {
     emit eventResponse("mediaReady", {cid, path});
+}
+
+// ── Config persistence ──────────────────────────────────────────────────────
+
+QString YoloBoardModule::load_saved_config() {
+    QFile f(uiConfigPath());
+    if (!f.open(QIODevice::ReadOnly)) return QStringLiteral("{}");
+    return QString::fromUtf8(f.readAll());
 }
