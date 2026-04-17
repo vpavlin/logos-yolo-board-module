@@ -592,13 +592,20 @@ QString YoloBoardModule::publish(const QString& text) {
 }
 
 QString YoloBoardModule::publish_with_attachment(const QString& text, const QString& filePath) {
+    qInfo() << "YoloBoardModule: publish_with_attachment called text=" << text << "path=" << filePath << "storageReady=" << m_storageReady;
     QString expanded = filePath;
     if (expanded.startsWith("~/"))
         expanded = QDir::homePath() + expanded.mid(1);
 
     QFileInfo fi(expanded);
-    if (!fi.exists()) return "Error: file not found: " + expanded;
-    if (!m_storageReady) return "Error: storage not ready";
+    if (!fi.exists()) {
+        qWarning() << "publish_with_attachment: file not found" << expanded;
+        return "Error: file not found: " + expanded;
+    }
+    if (!m_storageReady) {
+        qWarning() << "publish_with_attachment: storage not ready";
+        return "Error: storage not ready";
+    }
 
     QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
@@ -618,6 +625,7 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
 void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
                                  const QString& pendingMsgId) {
     Q_UNUSED(pendingMsgId);
+    qInfo() << "YoloBoardModule::runUpload starting" << filePath;
     QFileInfo fi(filePath);
     QString fileName = fi.fileName();
     QString ext = fi.suffix().toLower();
