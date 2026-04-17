@@ -71,9 +71,9 @@ private:
     QVariant storageCall(const QString& method, const QVariantList& args = {});
 
     // Channel helpers
-    QString encodeChannelName(const QString& name);
-    QString decodeChannelName(const QString& hexId);
-    QString channelDisplayName(const QString& channelId);
+    static QString encodeChannelName(const QString& name);
+    static QString decodeChannelName(const QString& hexId);
+    static QString channelDisplayName(const QString& channelId);
 
     // Cache helpers
     QString mediaCacheDir() const;
@@ -83,7 +83,7 @@ private:
     void saveCacheForChannel(const QString& channelId);
 
     // Message helpers
-    QVariantMap parseMessagePayload(const QString& data);
+    static QVariantMap parseMessagePayload(const QString& data);
     QVariantList buildChannelList() const;
 
     // Polling
