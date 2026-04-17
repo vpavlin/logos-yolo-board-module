@@ -609,6 +609,25 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
 
     QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
+    // Optimistic pending message so user sees something while upload runs
+    QVariantMap pendingMsg;
+    pendingMsg["id"]        = pendingId;
+    pendingMsg["data"]      = text.isEmpty() ? QString("\uD83D\uDDBC ") + fi.fileName() : text;
+    pendingMsg["channel"]   = m_ownChannelId;
+    pendingMsg["isOwn"]     = true;
+    pendingMsg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
+    pendingMsg["pending"]   = true;
+    pendingMsg["failed"]    = false;
+    pendingMsg["displayText"] = text;
+    QVariantMap mediaPlaceholder;
+    mediaPlaceholder["cid"]  = "uploading";
+    mediaPlaceholder["type"] = "image/png";
+    mediaPlaceholder["name"] = fi.fileName();
+    mediaPlaceholder["size"] = (int)fi.size();
+    pendingMsg["media"]     = QVariantList{mediaPlaceholder};
+    m_allMessages[m_ownChannelId].append(pendingMsg);
+    emitMessagesChanged(m_ownChannelId);
+
     m_uploading = true;
     setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
     emitStateChanged();
@@ -624,7 +643,6 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
 
 void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
                                  const QString& pendingMsgId) {
-    Q_UNUSED(pendingMsgId);
     qInfo() << "YoloBoardModule::runUpload starting" << filePath;
     QFileInfo fi(filePath);
     QString fileName = fi.fileName();
@@ -643,6 +661,15 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
         if (doc.isObject()) started = doc.object()["success"].toBool();
     }
     if (!started) {
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == pendingMsgId) {
+                m["pending"] = false; m["failed"] = true;
+                msgs[i] = m; break;
+            }
+        }
+        emitMessagesChanged(m_ownChannelId);
         m_uploading = false;
         setStatus("Upload failed");
         emitStateChanged();
@@ -654,8 +681,9 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
     auto* pollTimer = new QTimer(this);
     int* attempt = new int(0);
     pollTimer->setInterval(2000);
+    QString pendingMsgId2 = pendingMsgId;
     connect(pollTimer, &QTimer::timeout, this,
-            [this, pollTimer, attempt, text, filePath, fileName, mimeType, fileSize]() {
+            [this, pollTimer, attempt, text, filePath, fileName, mimeType, fileSize, pendingMsgId2]() {
         (*attempt)++;
         QString r = storageCall("manifestsJson", {}).toString();
         QString foundCid;
@@ -673,6 +701,15 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
 
         if (!foundCid.isEmpty()) {
             pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+
+            // Remove the placeholder pending message — publish() will add a new one
+            QVariantList& msgs = m_allMessages[m_ownChannelId];
+            for (int i = 0; i < msgs.size(); ++i) {
+                if (msgs[i].toMap()["id"].toString() == pendingMsgId2) {
+                    msgs.removeAt(i);
+                    break;
+                }
+            }
 
             // Cache locally
             QFile src(filePath);
@@ -706,6 +743,18 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
             publish(msg);
         } else if (*attempt >= 30) {
             pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+            // Mark placeholder as failed
+            QVariantList& msgs = m_allMessages[m_ownChannelId];
+            for (int i = 0; i < msgs.size(); ++i) {
+                QVariantMap m = msgs[i].toMap();
+                if (m["id"].toString() == pendingMsgId2) {
+                    m["pending"] = false;
+                    m["failed"] = true;
+                    msgs[i] = m;
+                    break;
+                }
+            }
+            emitMessagesChanged(m_ownChannelId);
             m_uploading = false;
             setStatus("Upload timed out");
             emitStateChanged();
