@@ -612,7 +612,7 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
     // Optimistic pending message so user sees something while upload runs
     QVariantMap pendingMsg;
     pendingMsg["id"]        = pendingId;
-    pendingMsg["data"]      = text.isEmpty() ? QString("\uD83D\uDDBC ") + fi.fileName() : text;
+    pendingMsg["data"]      = text.isEmpty() ? (QStringLiteral("[image] ") + fi.fileName()) : text;
     pendingMsg["channel"]   = m_ownChannelId;
     pendingMsg["isOwn"]     = true;
     pendingMsg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
