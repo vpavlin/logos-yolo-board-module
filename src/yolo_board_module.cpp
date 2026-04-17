@@ -322,36 +322,35 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 
     setStatus("Connecting\u2026");
 
-    // Defer heavy IPC work onto main thread event loop AFTER we return "pending"
-    // from this call. QRemoteObjects is thread-bound so all IPC must be on main.
-    QTimer::singleShot(0, this, [this]() {
-        initSequencer();
-        if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
-            setStatus("Error: could not determine channel ID");
-            return;
-        }
+    // Run IPC synchronously — this is a one-time setup call so blocking is OK.
+    // The UI should already treat configure as a long-running op.
+    initSequencer();
 
-        if (!m_channelIds.contains(m_ownChannelId))
-            m_channelIds.prepend(m_ownChannelId);
+    if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
+        setStatus("Error: could not determine channel ID");
+        return "Error: " + m_ownChannelId;
+    }
 
-        loadCacheForChannel(m_ownChannelId);
-        loadSubscriptions();
+    if (!m_channelIds.contains(m_ownChannelId))
+        m_channelIds.prepend(m_ownChannelId);
 
-        m_connected = true;
-        setStatus("Connected to " + m_nodeUrl);
+    loadCacheForChannel(m_ownChannelId);
+    loadSubscriptions();
 
-        m_pollTimer->start();
-        emitChannelsChanged();
+    m_connected = true;
+    setStatus("Connected to " + m_nodeUrl);
+
+    m_pollTimer->start();
+
+    // Initialize storage after brief delay (non-blocking)
+    QTimer::singleShot(500, this, [this]() {
+        initStorage();
         emitStateChanged();
-
-        // Initialize storage after brief delay
-        QTimer::singleShot(500, this, [this]() {
-            initStorage();
-            emitStateChanged();
-        });
     });
 
-    return "pending";
+    emitChannelsChanged();
+    emitStateChanged();
+    return m_ownChannelId;
 }
 
 // ── Public API: state snapshots ──────────────────────────────────────────────
