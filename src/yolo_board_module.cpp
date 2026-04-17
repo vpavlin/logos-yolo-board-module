@@ -308,44 +308,33 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 
     setStatus("Connecting\u2026");
 
-    // Run the heavy IPC work in background so we don't block the caller's IPC call
-    auto alive = m_alive;
-    QtConcurrent::run([this, alive]() {
-        if (!alive->load()) return;
+    // Defer heavy IPC work onto main thread event loop AFTER we return "pending"
+    // from this call. QRemoteObjects is thread-bound so all IPC must be on main.
+    QTimer::singleShot(0, this, [this]() {
         initSequencer();
-        if (!alive->load()) return;
+        if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
+            setStatus("Error: could not determine channel ID");
+            return;
+        }
 
-        QMetaObject::invokeMethod(this, [this, alive]() {
-            if (!alive->load()) return;
-            if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
-                setStatus("Error: could not determine channel ID");
-                return;
-            }
+        if (!m_channelIds.contains(m_ownChannelId))
+            m_channelIds.prepend(m_ownChannelId);
 
-            if (!m_channelIds.contains(m_ownChannelId))
-                m_channelIds.prepend(m_ownChannelId);
+        loadCacheForChannel(m_ownChannelId);
+        loadSubscriptions();
 
-            loadCacheForChannel(m_ownChannelId);
-            loadSubscriptions();
+        m_connected = true;
+        setStatus("Connected to " + m_nodeUrl);
 
-            m_connected = true;
-            setStatus("Connected to " + m_nodeUrl);
+        m_pollTimer->start();
+        emitChannelsChanged();
+        emitStateChanged();
 
-            // Start polling
-            m_pollTimer->start();
-            emitChannelsChanged();
+        // Initialize storage after brief delay
+        QTimer::singleShot(500, this, [this]() {
+            initStorage();
             emitStateChanged();
-
-            // Initialize storage async
-            QtConcurrent::run([this, alive]() {
-                if (!alive->load()) return;
-                initStorage();
-                if (!alive->load()) return;
-                QMetaObject::invokeMethod(this, [this]() {
-                    emitStateChanged();
-                }, Qt::QueuedConnection);
-            });
-        }, Qt::QueuedConnection);
+        });
     });
 
     return "pending";
@@ -856,74 +845,67 @@ void YoloBoardModule::fetchMessages(const QString& channelId) {
     if (m_fetchingChannels.contains(channelId)) return;
     m_fetchingChannels.insert(channelId);
 
-    auto alive = m_alive;
-    QtConcurrent::run([this, alive, channelId]() {
-        if (!alive->load()) return;
-        QString json = zoneCall("query_channel", {channelId, kQueryLimit}).toString();
-        if (!alive->load()) return;
+    // zoneCall is thread-bound to main thread — already on main thread here
+    // since this is called from poll timer. Just run sync.
+    QString json = zoneCall("query_channel", {channelId, kQueryLimit}).toString();
+    m_fetchingChannels.remove(channelId);
+    if (json.isEmpty() || json == "[]") return;
 
-        QMetaObject::invokeMethod(this, [this, alive, channelId, json]() {
-            if (!alive->load()) return;
-            m_fetchingChannels.remove(channelId);
-            if (json.isEmpty() || json == "[]") return;
+    QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    if (!doc.isArray()) return;
 
-            QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
-            if (!doc.isArray()) return;
+    QVariantList& existing = m_allMessages[channelId];
+    QSet<QString> seenIds;
+    for (const QVariant& v : existing)
+        seenIds.insert(v.toMap().value("id").toString());
 
-            QVariantList& existing = m_allMessages[channelId];
-            QSet<QString> seenIds;
-            for (const QVariant& v : existing)
-                seenIds.insert(v.toMap().value("id").toString());
+    bool added = false;
+    for (const QJsonValue& val : doc.array()) {
+        QJsonObject obj = val.toObject();
+        QString id = obj["id"].toString();
+        if (seenIds.contains(id)) continue;
 
-            bool added = false;
-            for (const QJsonValue& val : doc.array()) {
-                QJsonObject obj = val.toObject();
-                QString id = obj["id"].toString();
-                if (seenIds.contains(id)) continue;
+        QString text = obj["data"].toString();
 
-                QString text = obj["data"].toString();
-
-                bool confirmed = false;
-                for (int i = 0; i < existing.size(); ++i) {
-                    QVariantMap m = existing[i].toMap();
-                    if ((m.value("pending").toBool() || m.value("failed").toBool())
-                        && m.value("data").toString() == text) {
-                        m["pending"] = false;
-                        m["failed"]  = false;
-                        m["id"]      = id;
-                        existing[i]  = m;
-                        confirmed = true;
-                        break;
-                    }
-                }
-
-                if (!confirmed) {
-                    QVariantMap msg;
-                    msg["id"]        = id;
-                    msg["data"]      = text;
-                    msg["channel"]   = channelId;
-                    msg["isOwn"]     = (channelId == m_ownChannelId);
-                    msg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
-                    msg["pending"]   = false;
-                    msg["failed"]    = false;
-                    QVariantMap parsed = parseMessagePayload(text);
-                    msg["displayText"] = parsed["text"];
-                    msg["media"]       = parsed["media"];
-                    existing.append(msg);
-                    if (channelId != m_ownChannelId)
-                        m_unreadCounts[channelId] = m_unreadCounts.value(channelId, 0) + 1;
-                }
-                seenIds.insert(id);
-                added = true;
+        bool confirmed = false;
+        for (int i = 0; i < existing.size(); ++i) {
+            QVariantMap m = existing[i].toMap();
+            if ((m.value("pending").toBool() || m.value("failed").toBool())
+                && m.value("data").toString() == text) {
+                m["pending"] = false;
+                m["failed"]  = false;
+                m["id"]      = id;
+                existing[i]  = m;
+                confirmed = true;
+                break;
             }
+        }
 
-            if (added) {
-                saveCacheForChannel(channelId);
-                emitMessagesChanged(channelId);
-                emitChannelsChanged();
-            }
-        }, Qt::QueuedConnection);
-    });
+        if (!confirmed) {
+            QVariantMap msg;
+            msg["id"]        = id;
+            msg["data"]      = text;
+            msg["channel"]   = channelId;
+            msg["isOwn"]     = (channelId == m_ownChannelId);
+            msg["timestamp"] = QDateTime::currentDateTime().toString("HH:mm:ss");
+            msg["pending"]   = false;
+            msg["failed"]    = false;
+            QVariantMap parsed = parseMessagePayload(text);
+            msg["displayText"] = parsed["text"];
+            msg["media"]       = parsed["media"];
+            existing.append(msg);
+            if (channelId != m_ownChannelId)
+                m_unreadCounts[channelId] = m_unreadCounts.value(channelId, 0) + 1;
+        }
+        seenIds.insert(id);
+        added = true;
+    }
+
+    if (added) {
+        saveCacheForChannel(channelId);
+        emitMessagesChanged(channelId);
+        emitChannelsChanged();
+    }
 }
 
 // ── Events ───────────────────────────────────────────────────────────────────
