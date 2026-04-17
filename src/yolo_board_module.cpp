@@ -51,12 +51,12 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
         m_zoneClient = logosAPI->getClient(kZoneModuleName);
         // Trigger token exchange with a harmless no-op call
         if (m_zoneClient) {
-            m_zoneClient->invokeRemoteMethod(kZoneModuleName, "name", {});
+            m_zoneClient->invokeRemoteMethod(QString(kZoneModuleName), QString("name"), QVariantList{});
         }
         qInfo() << "YoloBoardModule: pre-warming storage client";
         m_storageClient = logosAPI->getClient(kStorageModuleName);
         if (m_storageClient) {
-            m_storageClient->invokeRemoteMethod(kStorageModuleName, "name", {});
+            m_storageClient->invokeRemoteMethod(QString(kStorageModuleName), QString("name"), QVariantList{});
         }
         qInfo() << "YoloBoardModule: pre-warming done";
     });
