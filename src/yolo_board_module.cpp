@@ -321,46 +321,49 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     loadChannelFromFile();  // optional — can be derived
 
     setStatus("Connecting\u2026");
+    emitStateChanged();
 
-    // Run IPC synchronously — this is a one-time setup call so blocking is OK.
-    // The UI should already treat configure as a long-running op.
-    initSequencer();
+    // Must return immediately — if we block here calling zoneCall, main thread
+    // can't process the IPC response, causing deadlock. Defer work to next
+    // event loop iteration.
+    QTimer::singleShot(0, this, [this]() {
+        initSequencer();
 
-    if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
-        setStatus("Error: could not determine channel ID");
-        return "Error: " + m_ownChannelId;
-    }
+        if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
+            setStatus("Error: could not determine channel ID");
+            emitStateChanged();
+            return;
+        }
 
-    if (!m_channelIds.contains(m_ownChannelId))
-        m_channelIds.prepend(m_ownChannelId);
+        if (!m_channelIds.contains(m_ownChannelId))
+            m_channelIds.prepend(m_ownChannelId);
 
-    loadCacheForChannel(m_ownChannelId);
-    loadSubscriptions();
+        loadCacheForChannel(m_ownChannelId);
+        loadSubscriptions();
 
-    m_connected = true;
-    setStatus("Connected to " + m_nodeUrl);
+        m_connected = true;
+        setStatus("Connected to " + m_nodeUrl);
 
-    // Save config for next launch
-    {
+        // Save config for next launch
         QJsonObject cfg;
         cfg["dataDir"] = m_dataDir;
         cfg["nodeUrl"] = m_nodeUrl;
         QFile f(uiConfigPath());
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
             f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
-    }
 
-    m_pollTimer->start();
-
-    // Initialize storage after brief delay (non-blocking)
-    QTimer::singleShot(500, this, [this]() {
-        initStorage();
+        m_pollTimer->start();
+        emitChannelsChanged();
         emitStateChanged();
+
+        // Initialize storage after brief delay
+        QTimer::singleShot(1000, this, [this]() {
+            initStorage();
+            emitStateChanged();
+        });
     });
 
-    emitChannelsChanged();
-    emitStateChanged();
-    return m_ownChannelId;
+    return "pending";
 }
 
 // ── Public API: state snapshots ──────────────────────────────────────────────
