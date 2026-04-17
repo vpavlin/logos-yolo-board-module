@@ -43,13 +43,29 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
     logosAPI = api;
     qInfo() << "YoloBoardModule: initLogos called";
 
+    // Load saved config so get_state returns the persisted dataDir/nodeUrl
+    // even before the user clicks Connect. The UI can then show them and
+    // auto-trigger configure().
+    {
+        QFile f(uiConfigPath());
+        if (f.open(QIODevice::ReadOnly)) {
+            QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+            if (doc.isObject()) {
+                QJsonObject obj = doc.object();
+                m_dataDir = obj["dataDir"].toString();
+                m_nodeUrl = obj["nodeUrl"].toString();
+                qInfo() << "YoloBoardModule: loaded saved config dataDir=" << m_dataDir << "nodeUrl=" << m_nodeUrl;
+            }
+        }
+    }
+
     // Pre-warm clients and token cache for dependencies so the first
     // user-initiated call doesn't trigger the token-exchange dance while
     // our main thread is blocked on an IPC response (deadlock).
+    // After pre-warm, auto-connect if we have saved config.
     QTimer::singleShot(0, this, [this]() {
         qInfo() << "YoloBoardModule: pre-warming zone-sequencer client";
         m_zoneClient = logosAPI->getClient(kZoneModuleName);
-        // Trigger token exchange with a harmless no-op call
         if (m_zoneClient) {
             m_zoneClient->invokeRemoteMethod(QString(kZoneModuleName), QString("name"), QVariantList{});
         }
@@ -59,6 +75,12 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
             m_storageClient->invokeRemoteMethod(QString(kStorageModuleName), QString("name"), QVariantList{});
         }
         qInfo() << "YoloBoardModule: pre-warming done";
+
+        // Auto-connect with saved config
+        if (!m_dataDir.isEmpty() && !m_nodeUrl.isEmpty() && !m_connected) {
+            qInfo() << "YoloBoardModule: auto-connecting with saved config";
+            configure(m_dataDir, m_nodeUrl);
+        }
     });
 }
 
