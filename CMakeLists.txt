@@ -39,7 +39,9 @@ if(LOGOS_CPP_SDK_ROOT)
     target_link_libraries(${PLUGIN_TARGET} PRIVATE
         Qt6::Core
         Qt6::Concurrent
+        -Wl,--whole-archive
         ${LOGOS_CPP_SDK_ROOT}/lib/liblogos_sdk.a
+        -Wl,--no-whole-archive
     )
 else()
     target_link_libraries(${PLUGIN_TARGET} PRIVATE
