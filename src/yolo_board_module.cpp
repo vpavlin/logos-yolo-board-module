@@ -306,29 +306,49 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     if (!loadKeyFromFile()) return "Error: cannot read sequencer.key in " + expanded;
     loadChannelFromFile();  // optional — can be derived
 
-    initSequencer();
-    if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:"))
-        return "Error: could not determine channel ID";
+    setStatus("Connecting\u2026");
 
-    if (!m_channelIds.contains(m_ownChannelId))
-        m_channelIds.prepend(m_ownChannelId);
+    // Run the heavy IPC work in background so we don't block the caller's IPC call
+    auto alive = m_alive;
+    QtConcurrent::run([this, alive]() {
+        if (!alive->load()) return;
+        initSequencer();
+        if (!alive->load()) return;
 
-    loadCacheForChannel(m_ownChannelId);
-    loadSubscriptions();
+        QMetaObject::invokeMethod(this, [this, alive]() {
+            if (!alive->load()) return;
+            if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
+                setStatus("Error: could not determine channel ID");
+                return;
+            }
 
-    m_connected = true;
-    setStatus("Connected to " + m_nodeUrl);
+            if (!m_channelIds.contains(m_ownChannelId))
+                m_channelIds.prepend(m_ownChannelId);
 
-    // Initialize storage (best-effort)
-    QTimer::singleShot(500, this, [this]() { initStorage(); emitStateChanged(); });
+            loadCacheForChannel(m_ownChannelId);
+            loadSubscriptions();
 
-    // Start polling
-    m_pollTimer->start();
+            m_connected = true;
+            setStatus("Connected to " + m_nodeUrl);
 
-    emitChannelsChanged();
-    emitStateChanged();
+            // Start polling
+            m_pollTimer->start();
+            emitChannelsChanged();
+            emitStateChanged();
 
-    return m_ownChannelId;
+            // Initialize storage async
+            QtConcurrent::run([this, alive]() {
+                if (!alive->load()) return;
+                initStorage();
+                if (!alive->load()) return;
+                QMetaObject::invokeMethod(this, [this]() {
+                    emitStateChanged();
+                }, Qt::QueuedConnection);
+            });
+        }, Qt::QueuedConnection);
+    });
+
+    return "pending";
 }
 
 // ── Public API: state snapshots ──────────────────────────────────────────────
