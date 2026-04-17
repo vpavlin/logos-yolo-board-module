@@ -59,22 +59,11 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
         }
     }
 
-    // Pre-warm clients and token cache for dependencies so the first
-    // user-initiated call doesn't trigger the token-exchange dance while
-    // our main thread is blocked on an IPC response (deadlock).
-    // After pre-warm, auto-connect if we have saved config.
+    // Get clients but don't trigger token exchange yet (it's slow due to
+    // capability_module's 20s informModuleToken timeout).
     QTimer::singleShot(0, this, [this]() {
-        qInfo() << "YoloBoardModule: pre-warming zone-sequencer client";
         m_zoneClient = logosAPI->getClient(kZoneModuleName);
-        if (m_zoneClient) {
-            m_zoneClient->invokeRemoteMethod(QString(kZoneModuleName), QString("name"), QVariantList{});
-        }
-        qInfo() << "YoloBoardModule: pre-warming storage client";
         m_storageClient = logosAPI->getClient(kStorageModuleName);
-        if (m_storageClient) {
-            m_storageClient->invokeRemoteMethod(QString(kStorageModuleName), QString("name"), QVariantList{});
-        }
-        qInfo() << "YoloBoardModule: pre-warming done";
 
         // Auto-connect with saved config
         if (!m_dataDir.isEmpty() && !m_nodeUrl.isEmpty() && !m_connected) {
