@@ -603,8 +603,13 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
         return "Error: file not found: " + expanded;
     }
     if (!m_storageReady) {
-        qWarning() << "publish_with_attachment: storage not ready";
-        return "Error: storage not ready";
+        qWarning() << "publish_with_attachment: storage not ready, will retry in 2s";
+        // Retry until storage becomes ready (max 30s)
+        QString textCopy = text, pathCopy = expanded;
+        QTimer::singleShot(2000, this, [this, textCopy, pathCopy]() {
+            publish_with_attachment(textCopy, pathCopy);
+        });
+        return "pending-storage";
     }
 
     QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
