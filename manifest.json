@@ -1,0 +1,8 @@
+{
+  "name": "yolo_board_module",
+  "version": "0.1.0",
+  "description": "Yolo Board backend module — orchestrates zone-sequencer and storage for the UI",
+  "type": "core",
+  "category": "social",
+  "dependencies": ["liblogos_zone_sequencer_module", "storage_module"]
+}
