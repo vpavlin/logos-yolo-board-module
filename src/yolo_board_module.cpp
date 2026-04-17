@@ -385,9 +385,13 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
         emitChannelsChanged();
         emitStateChanged();
 
-        // Initialize storage after brief delay
-        QTimer::singleShot(1000, this, [this]() {
+        // Kick off storage init immediately. storage.start() can take 20-30s
+        // (discovery + transport bind), so the sooner we begin the better.
+        QTimer::singleShot(0, this, [this]() {
+            setStatus("Starting storage…");
+            emitStateChanged();
             initStorage();
+            setStatus("Connected to " + m_nodeUrl);
             emitStateChanged();
         });
     });
@@ -579,19 +583,11 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
         qWarning() << "publish_with_attachment: file not found" << expanded;
         return "Error: file not found: " + expanded;
     }
-    if (!m_storageReady) {
-        qWarning() << "publish_with_attachment: storage not ready, will retry in 2s";
-        // Retry until storage becomes ready (max 30s)
-        QString textCopy = text, pathCopy = expanded;
-        QTimer::singleShot(2000, this, [this, textCopy, pathCopy]() {
-            publish_with_attachment(textCopy, pathCopy);
-        });
-        return "pending-storage";
-    }
 
     QString pendingId = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-    // Optimistic pending message so user sees something while upload runs
+    // Optimistic pending message — added immediately so the user gets
+    // visual feedback even if storage isn't ready yet (start can take 20-30s).
     QVariantMap pendingMsg;
     pendingMsg["id"]        = pendingId;
     pendingMsg["data"]      = text.isEmpty() ? (QStringLiteral("[image] ") + fi.fileName()) : text;
@@ -611,16 +607,33 @@ QString YoloBoardModule::publish_with_attachment(const QString& text, const QStr
     emitMessagesChanged(m_ownChannelId);
 
     m_uploading = true;
-    setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
+    if (!m_storageReady) {
+        setStatus("Waiting for storage to start\u2026");
+    } else {
+        setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
+    }
     emitStateChanged();
 
-    // Run upload as a state machine on the main thread, using QTimer to
-    // schedule each step (manifest poll). All IPC stays on main thread.
+    // Defer to main thread; if storage isn't ready, runUpload retries until it is.
     QTimer::singleShot(0, this, [this, text, expanded, pendingId]() {
-        runUpload(text, expanded, pendingId);
+        startUploadWhenReady(text, expanded, pendingId);
     });
 
     return pendingId;
+}
+
+void YoloBoardModule::startUploadWhenReady(const QString& text, const QString& filePath,
+                                            const QString& pendingMsgId) {
+    if (!m_storageReady) {
+        QTimer::singleShot(1000, this, [this, text, filePath, pendingMsgId]() {
+            startUploadWhenReady(text, filePath, pendingMsgId);
+        });
+        return;
+    }
+    QFileInfo fi(filePath);
+    setStatus("Uploading " + fi.fileName() + QStringLiteral("\u2026"));
+    emitStateChanged();
+    runUpload(text, filePath, pendingMsgId);
 }
 
 void YoloBoardModule::runUpload(const QString& text, const QString& filePath,

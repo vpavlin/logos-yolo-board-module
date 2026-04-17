@@ -91,6 +91,7 @@ private:
     void fetchMessages(const QString& channelId);
 
     // Media upload/download
+    void startUploadWhenReady(const QString& text, const QString& filePath, const QString& pendingMsgId);
     void runUpload(const QString& text, const QString& filePath, const QString& pendingMsgId);
     void runDownload(const QString& cid);
 
