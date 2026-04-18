@@ -48,6 +48,11 @@ public:
 
     // Config persistence (for UI auto-connect)
     Q_INVOKABLE virtual QString load_saved_config() = 0;  // returns JSON {"dataDir":"","nodeUrl":""}
+
+    // The QML host sandbox restricts file:// to the plugin's own directory
+    // and disables network. UI calls this once with its own dir so
+    // resolve_media can mirror cached media files there.
+    Q_INVOKABLE virtual void set_ui_dir(const QString& uiDir) = 0;
 };
 #define IYoloBoardModule_iid "org.logos.iyoloboardmodule"
 Q_DECLARE_INTERFACE(IYoloBoardModule, IYoloBoardModule_iid)

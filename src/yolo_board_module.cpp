@@ -4,6 +4,7 @@
 
 #include <QDebug>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -649,11 +650,20 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
     else if (ext == "webp") mimeType = "image/webp";
     int fileSize = fi.size();
 
-    QString upResult = storageCall("uploadUrlJson", {filePath, (qlonglong)65536}).toString();
+    // libstorage's start can run for ~30s on a detached thread inside
+    // storage_module. uploadUrl returns failure during that window, so we
+    // retry until it sticks (or we give up).
     bool started = false;
-    {
+    for (int i = 0; i < 60 && !started; ++i) {
+        QString upResult = storageCall("uploadUrlJson", {filePath, (qlonglong)65536}).toString();
         QJsonDocument doc = QJsonDocument::fromJson(upResult.toUtf8());
         if (doc.isObject()) started = doc.object()["success"].toBool();
+        if (!started) {
+            qInfo() << "uploadUrlJson not ready, retry in 1s, attempt" << i;
+            QEventLoop loop;
+            QTimer::singleShot(1000, &loop, &QEventLoop::quit);
+            loop.exec();
+        }
     }
     if (!started) {
         QVariantList& msgs = m_allMessages[m_ownChannelId];
@@ -761,13 +771,43 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
 // ── Public API: media ────────────────────────────────────────────────────────
 
 QString YoloBoardModule::resolve_media(const QString& cid) {
-    if (m_mediaPaths.contains(cid)) return m_mediaPaths[cid];
-    QString path = mediaCachePath(cid);
-    if (!path.isEmpty() && QFile::exists(path)) {
+    QString path;
+    if (m_mediaPaths.contains(cid)) {
+        path = m_mediaPaths[cid];
+    } else {
+        path = mediaCachePath(cid);
+        if (path.isEmpty() || !QFile::exists(path))
+            return {};
         m_mediaPaths[cid] = path;
-        return path;
     }
-    return {};
+
+    // The QML plugin engine forbids both file:// outside its own dir and
+    // network access (so data: URLs also fail). Mirror the file into the
+    // QML plugin's directory if the UI told us where that is, and return
+    // the path so QML can load it as a regular file://.
+    if (!m_uiDir.isEmpty()) {
+        QString sub = m_uiDir + "/media";
+        QDir().mkpath(sub);
+        QString mirrored = sub + "/" + cid;
+        QFileInfo mi(mirrored);
+        // If symlink (from older builds) or stale, replace with a real copy
+        // — the QML sandbox resolves symlinks and refuses if the target is
+        // outside the allowed root.
+        if (mi.isSymLink() || !mi.exists()) {
+            QFile::remove(mirrored);
+            QFile::copy(path, mirrored);
+        }
+        return mirrored;
+    }
+    return path;
+}
+
+void YoloBoardModule::set_ui_dir(const QString& uiDir) {
+    QString d = uiDir;
+    if (d.startsWith("file://")) d = d.mid(7);
+    while (d.endsWith('/')) d.chop(1);
+    m_uiDir = d;
+    qInfo() << "YoloBoardModule: ui dir set to" << m_uiDir;
 }
 
 void YoloBoardModule::fetch_media(const QString& cid) {

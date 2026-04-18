@@ -49,6 +49,7 @@ public:
     Q_INVOKABLE void start_backfill(const QString& channelId) override;
     Q_INVOKABLE void stop_backfill(const QString& channelId) override;
     Q_INVOKABLE QString load_saved_config() override;
+    Q_INVOKABLE void set_ui_dir(const QString& uiDir) override;
 
 signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
@@ -121,6 +122,7 @@ private:
     bool         m_storageReady = false;
     bool         m_uploading = false;
 
+    QString      m_uiDir;
     QStringList                 m_channelIds;
     QMap<QString, QVariantList> m_allMessages;
     QMap<QString, int>          m_unreadCounts;
