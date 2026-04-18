@@ -1,39 +1,111 @@
-# logos-yolo-board-module (experimental)
+# logos-yolo-board-module
 
-A Logos Core module that was meant to own all Yolo Board backend logic (polling, media cache, subscriptions, upload orchestration) so the QML UI could be a thin client doing `logos.callModule("yolo_board_module", ...)` + event subscriptions.
+A Logos Core module that owns all Yolo Board backend logic — polling, message cache,
+subscription persistence, upload orchestration, media cache. The QML UI is a thin
+client that does `logos.callModule("yolo_board_module", ...)` plus event subscriptions.
 
-## Status: shelved
+## Status: working
 
-The architecture is the right shape — the QML UI should NOT directly reach into `zone-sequencer` and `storage` modules; a domain module should mediate — but making it work in the current Basecamp stack hit **framework-level deadlocks**. See [../zone-sdk-test/docs/FEEDBACK.md](../zone-sdk-test/docs/FEEDBACK.md) §14–19 for details. Briefly:
+The architecture took several iterations to land — the original attempt hit
+framework-level deadlocks documented in [../zone-sdk-test/docs/FEEDBACK.md](../zone-sdk-test/docs/FEEDBACK.md)
+§14–19. The combination of fixes that made it work:
 
-1. **Sync module-to-module IPC deadlocks** when the caller is already inside an IPC handler (classic event-loop reentrancy). Our `configure()` blocks trying to call `zone-sequencer.set_node_url`, while `capability_module` simultaneously tries to `informModuleToken(yolo_board_module, ...)` — yolo's event loop is busy → 20s timeout per IPC round-trip.
+1. **`--whole-archive` in CMakeLists.txt** so `ModuleProxy` symbols aren't
+   stripped from the plugin `.so` → capability_module's `informModuleToken` calls
+   actually reach this module.
+2. **All cross-module IPC dispatched on the main thread via `QTimer::singleShot(0, this, ...)`**
+   instead of `QtConcurrent::run` — `QRemoteObjects` clients are main-thread bound
+   and silently drop calls from worker threads.
+3. **JSON wrapper methods on storage_module** (`uploadUrlJson`, `manifestsJson`,
+   `downloadFileJson`, `existsJson`) returning `std::string` to dodge the
+   broken `LogosResult` Qt-IPC serialization.
+4. **Detached `storage_module.start()`** (in our storage_module fork) so the
+   ~30 s libstorage startup doesn't block this module's main thread.
+5. **`set_ui_dir(qmlPath)`** invoked from the QML side at startup so
+   `resolve_media` can copy cached media files into the QML plugin's allowed
+   root — the only file:// location the Basecamp QML host accepts.
 
-2. **Per-call token re-request** amplifies the problem: `LogosAPIClient`'s token cache doesn't persist between calls (or is per-target not per-client), so every `zoneCall` triggers the full capability_module dance.
+## What this module exposes
 
-3. **SDK-level `ModuleProxy`** is required to receive `informModuleToken` calls, but without `--whole-archive` in the link step, the symbols are stripped from the plugin `.so` → the target module silently can't be informed.
+`Q_INVOKABLE` API (see `src/i_yolo_board_module.h`):
 
-4. **`RTLD_GLOBAL` plugin loading** means even if a plugin's `.so` has the right `ModuleProxy` (with the `LogosResult → JSON` fix), the host process's copy wins — fixes don't deploy per-plugin.
+- **Lifecycle**: `initLogos`, `configure(dataDir, nodeUrl)`, `load_saved_config`, `set_ui_dir`
+- **State snapshots**: `get_state()`, `get_messages(channelId)`, `get_channels()` — return JSON strings the QML side polls
+- **Channels**: `subscribe(idOrName)`, `unsubscribe(id)`, `clear_unread(id)`
+- **Publishing**: `publish(text)`, `publish_with_attachment(text, filePath)`
+- **Media**: `resolve_media(cid)`, `fetch_media(cid)`
+- **Control**: `reset_checkpoint`, `start_backfill(channelId)`, `stop_backfill(channelId)`
 
-The zone-sequencer-module fork has been updated with `--whole-archive` (fixes #3 above), but #1/#2 require framework changes to either:
-- Pre-warm tokens at module startup so no runtime handshake is needed, OR
-- Provide a reliably-async `callModuleAsync` + `onModuleEvent` in `LogosQmlBridge` so the UI can talk directly to core modules without blocking.
+Events emitted as `eventResponse` signals:
 
-Once one of those lands in Basecamp, this module becomes viable. Until then, Yolo Board's QML calls `zone-sequencer` and `storage` directly.
+- `stateChanged`, `messagesChanged`, `channelsChanged`, `statusChanged`, `mediaReady`
 
-## What's in here
+## How it talks to the world
 
-- `src/i_yolo_board_module.h` / `.cpp` — Q_INVOKABLE interface: `configure`, `subscribe`, `publish`, `publish_with_attachment`, `fetch_media`, `start_backfill`, etc. plus event emission for `stateChanged`, `messagesChanged`, `channelsChanged`, `statusChanged`, `mediaReady`.
-- `src/yolo_board_module.cpp` — full implementation porting the business logic from the old `YoloBoardBackend.cpp` (polling, message cache, backfill, upload orchestration, etc.) adapted for the module lifecycle.
-- Standard `CMakeLists.txt` + `flake.nix` + `metadata.json` for a `core` module.
+```
+Basecamp QML host                       Module process (logos_host)
+┌──────────────────────┐                ┌─────────────────────────────────┐
+│  Main.qml            │   callModule    │  yolo_board_module              │
+│  poll get_state()    │ ─────────────> │   ├─ persistent state            │
+│  poll get_messages() │                 │   ├─ poll zone-sequencer (1.5s) │
+│  call publish_*()    │                 │   ├─ media cache                │
+└──────────────────────┘                 │   └─ upload orchestration       │
+                                         └────────┬───────┬───────────────┘
+                                                  │       │
+                                            QtRO  │       │  QtRO
+                                                  ▼       ▼
+                                  liblogos_zone_sequencer  storage_module
+                                  (publishes inscriptions, (Codex node,
+                                   queries channels)        upload + retrieval)
+```
 
-Build works: `nix build .#plugin` produces `libyolo_board_module.so`. Loading works (logoscore confirms it). `configure()` with the dataDir path returns the channel ID immediately. Subsequent IPC calls to zone-sequencer hit the deadlock described above.
+All cross-process IPC happens on this module's main thread via `QTimer::singleShot`
+or repeating `QTimer` for polling — never from `QtConcurrent`.
 
-## Revisit conditions
+## Auto-connect
 
-Come back to this module when ANY of:
-- Basecamp ships `callModuleAsync` + `onModuleEvent` in `LogosQmlBridge`
-- SDK provides pre-warmed tokens at module load time
-- Capability module's `informModuleToken` becomes fully async (doesn't need target to respond)
-- The RTLD_GLOBAL ABI issue is solved so plugins can carry their own SDK
+On `initLogos`, the module loads `~/.config/logos/yolo_board.json` if present and
+auto-runs `configure()` with the saved `dataDir` + `nodeUrl`. Subsequent
+`get_state()` polls report `connected: true` once the zone-sequencer responds
+and `storageReady: true` once libstorage's start completes.
 
-At that point the QML can be reduced to property bindings over `get_state()` plus a handful of `callModule` action invocations, and the domain logic lives in one place.
+## Build
+
+```bash
+nix build              # produces yolo-board-module.lgx
+```
+
+The `--whole-archive` link is set in `CMakeLists.txt`. If you fork or refactor,
+verify with `nm libyolo_board_module.so | grep -i ModuleProxy` — if empty, IPC
+won't work.
+
+## Install
+
+Use the `/basecamp-deploy` Claude Code skill, or manually:
+
+```bash
+LGPM=…/logos-package-manager/scripts/lgpm
+BASECAMP=~/.local/share/Logos/LogosBasecampDev
+$LGPM --modules-dir $BASECAMP/modules --ui-plugins-dir $BASECAMP/plugins \
+      install --file ./result/yolo-board-module.lgx
+sed -i 's/"linux-amd64"/"linux-amd64-dev"/g; s/"linux-x86_64"/"linux-x86_64-dev"/g' \
+      $BASECAMP/modules/yolo_board_module/manifest.json
+```
+
+## Caveats / known issues
+
+- `storage_module.start()` blocks ~30 s on first launch (discovery + transport
+  bind). Our forked storage_module detaches it; without that fork, this
+  module's main thread is blocked the same ~30 s and `publish_with_attachment`
+  retries `uploadUrlJson` until libstorage is up.
+- `resolve_media` only works for files this module has cached locally
+  (own-channel uploads + previously-fetched downloads). Cross-channel images
+  trigger `fetch_media` → `runDownload`, which only completes if storage has
+  peers serving the CID.
+- `LogosResult` returns from upstream modules are still broken — every storage
+  call we make goes through the `*Json` wrappers. If new storage methods are
+  needed, add JSON wrappers in storage_module first.
+- Backfill (`runBackfill`) still uses `QtConcurrent::run` for the loop body —
+  it works because it dispatches IPC results back via
+  `QMetaObject::invokeMethod(this, ..., Qt::QueuedConnection)`, but the
+  cleaner fix would be a single repeating `QTimer` like `runUpload`.
