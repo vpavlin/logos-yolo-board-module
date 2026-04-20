@@ -399,18 +399,10 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
             setStatus("Connected to " + m_nodeUrl);
             emitStateChanged();
 
-            // Auto-dial any saved storage peer so the user doesn't have to
-            // reconnect after every restart. Must run off the main thread
-            // so publishes/uploads aren't queued behind a slow connect.
-            if (!m_savedPeerId.isEmpty() && !m_savedPeerDialed) {
-                m_savedPeerDialed = true;
-                QString pid = m_savedPeerId;
-                QString addrs = m_savedPeerAddrs;
-                QtConcurrent::run([this, pid, addrs]() {
-                    qInfo() << "Auto-dialing saved storage peer" << pid;
-                    connect_storage_peer(pid, addrs);
-                });
-            }
+            // Previously we auto-dialed the saved peer here, but the
+            // synchronous storageCall("connect", ...) serializes with
+            // uploadUrl on the QRO channel and stalls the first publish.
+            // Let the user click Connect manually — fields are pre-filled.
         });
     });
 
