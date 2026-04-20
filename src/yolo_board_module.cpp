@@ -1110,7 +1110,12 @@ QString YoloBoardModule::connect_storage_peer(const QString& peerId,
     }
 
     qInfo() << "connect_storage_peer" << pid << addrs;
-    QVariant result = storageCall("connect", {pid, QVariant::fromValue(addrs)});
+    // Pass addrs as a QVariantList of QStrings — QVariant::fromValue(QStringList)
+    // was not deserializing to std::vector<std::string> on the storage replica,
+    // causing the QRO call to time out after 20 s without ever being invoked.
+    QVariantList addrVariants;
+    for (const QString& a : addrs) addrVariants.append(a);
+    QVariant result = storageCall("connect", {pid, addrVariants});
     QString resultStr = result.toString();
     setStatus(QStringLiteral("connect %1: %2")
                   .arg(pid.left(12) + QStringLiteral("\u2026"), resultStr));
