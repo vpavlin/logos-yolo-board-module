@@ -400,10 +400,16 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
             emitStateChanged();
 
             // Auto-dial any saved storage peer so the user doesn't have to
-            // reconnect after every restart.
+            // reconnect after every restart. Must run off the main thread
+            // so publishes/uploads aren't queued behind a slow connect.
             if (!m_savedPeerId.isEmpty() && !m_savedPeerDialed) {
-                qInfo() << "Auto-dialing saved storage peer" << m_savedPeerId;
-                connect_storage_peer(m_savedPeerId, m_savedPeerAddrs);
+                m_savedPeerDialed = true;
+                QString pid = m_savedPeerId;
+                QString addrs = m_savedPeerAddrs;
+                QtConcurrent::run([this, pid, addrs]() {
+                    qInfo() << "Auto-dialing saved storage peer" << pid;
+                    connect_storage_peer(pid, addrs);
+                });
             }
         });
     });
