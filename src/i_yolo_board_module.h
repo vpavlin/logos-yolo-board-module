@@ -53,6 +53,13 @@ public:
     // and disables network. UI calls this once with its own dir so
     // resolve_media can mirror cached media files there.
     Q_INVOKABLE virtual void set_ui_dir(const QString& uiDir) = 0;
+
+    // Ask the storage node to dial a peer. `addressesCsv` is a comma-separated
+    // list of multiaddrs (may be empty to let the node discover via DHT).
+    // Returns a short status string for immediate UI feedback; the underlying
+    // call is async and logs completion via the usual storage events.
+    Q_INVOKABLE virtual QString connect_storage_peer(const QString& peerId,
+                                                     const QString& addressesCsv) = 0;
 };
 #define IYoloBoardModule_iid "org.logos.iyoloboardmodule"
 Q_DECLARE_INTERFACE(IYoloBoardModule, IYoloBoardModule_iid)

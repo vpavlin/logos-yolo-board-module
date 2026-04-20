@@ -51,6 +51,9 @@ public:
     Q_INVOKABLE QString load_saved_config() override;
     Q_INVOKABLE void set_ui_dir(const QString& uiDir) override;
 
+    Q_INVOKABLE QString connect_storage_peer(const QString& peerId,
+                                             const QString& addressesCsv) override;
+
 signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
 

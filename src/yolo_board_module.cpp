@@ -1083,3 +1083,26 @@ QString YoloBoardModule::load_saved_config() {
     if (!f.open(QIODevice::ReadOnly)) return QStringLiteral("{}");
     return QString::fromUtf8(f.readAll());
 }
+
+// ── Storage peer connect ────────────────────────────────────────────────────
+
+QString YoloBoardModule::connect_storage_peer(const QString& peerId,
+                                              const QString& addressesCsv) {
+    if (!m_storageReady) return QStringLiteral("Error: storage not ready");
+    QString pid = peerId.trimmed();
+    if (pid.isEmpty()) return QStringLiteral("Error: peer id required");
+
+    QStringList addrs;
+    for (const QString& a : addressesCsv.split(',', Qt::SkipEmptyParts)) {
+        QString t = a.trimmed();
+        if (!t.isEmpty()) addrs.append(t);
+    }
+
+    qInfo() << "connect_storage_peer" << pid << addrs;
+    QVariant result = storageCall("connect", {pid, QVariant::fromValue(addrs)});
+    QString resultStr = result.toString();
+    setStatus(QStringLiteral("connect %1: %2")
+                  .arg(pid.left(12) + QStringLiteral("\u2026"), resultStr));
+    emitStateChanged();
+    return resultStr.isEmpty() ? QStringLiteral("pending") : resultStr;
+}
