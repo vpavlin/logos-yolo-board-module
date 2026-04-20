@@ -126,6 +126,11 @@ private:
     bool         m_uploading = false;
 
     QString      m_uiDir;
+
+    // Saved storage peer (persisted to uiConfigPath())
+    QString      m_savedPeerId;
+    QString      m_savedPeerAddrs;
+    bool         m_savedPeerDialed = false;
     QStringList                 m_channelIds;
     QMap<QString, QVariantList> m_allMessages;
     QMap<QString, int>          m_unreadCounts;

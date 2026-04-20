@@ -55,7 +55,11 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
                 QJsonObject obj = doc.object();
                 m_dataDir = obj["dataDir"].toString();
                 m_nodeUrl = obj["nodeUrl"].toString();
-                qInfo() << "YoloBoardModule: loaded saved config dataDir=" << m_dataDir << "nodeUrl=" << m_nodeUrl;
+                m_savedPeerId = obj["peerId"].toString();
+                m_savedPeerAddrs = obj["peerAddrs"].toString();
+                qInfo() << "YoloBoardModule: loaded saved config dataDir=" << m_dataDir
+                        << "nodeUrl=" << m_nodeUrl
+                        << "peerId=" << m_savedPeerId;
             }
         }
     }
@@ -394,6 +398,13 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
             initStorage();
             setStatus("Connected to " + m_nodeUrl);
             emitStateChanged();
+
+            // Auto-dial any saved storage peer so the user doesn't have to
+            // reconnect after every restart.
+            if (!m_savedPeerId.isEmpty() && !m_savedPeerDialed) {
+                qInfo() << "Auto-dialing saved storage peer" << m_savedPeerId;
+                connect_storage_peer(m_savedPeerId, m_savedPeerAddrs);
+            }
         });
     });
 
@@ -412,6 +423,8 @@ QString YoloBoardModule::get_state() {
     state["ownChannelName"] = channelDisplayName(m_ownChannelId);
     state["nodeUrl"] = m_nodeUrl;
     state["dataDir"] = m_dataDir;
+    state["savedPeerId"] = m_savedPeerId;
+    state["savedPeerAddrs"] = m_savedPeerAddrs;
 
     QJsonArray channels;
     for (const QString& id : m_channelIds) {
@@ -1103,6 +1116,25 @@ QString YoloBoardModule::connect_storage_peer(const QString& peerId,
     QString resultStr = result.toString();
     setStatus(QStringLiteral("connect %1: %2")
                   .arg(pid.left(12) + QStringLiteral("\u2026"), resultStr));
+
+    // Persist so we auto-dial on next start.
+    m_savedPeerId = pid;
+    m_savedPeerAddrs = addressesCsv.trimmed();
+    m_savedPeerDialed = true;
+    {
+        QFile f(uiConfigPath());
+        QJsonObject cfg;
+        if (f.open(QIODevice::ReadOnly)) {
+            cfg = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+        }
+        cfg["dataDir"] = m_dataDir;
+        cfg["nodeUrl"] = m_nodeUrl;
+        cfg["peerId"] = m_savedPeerId;
+        cfg["peerAddrs"] = m_savedPeerAddrs;
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+            f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+    }
     emitStateChanged();
     return resultStr.isEmpty() ? QStringLiteral("pending") : resultStr;
 }
