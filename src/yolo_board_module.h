@@ -70,6 +70,8 @@ private:
     // Subscribes the four storage_module events we care about. Safe to call
     // more than once — no-ops on duplicate subscribes in the SDK.
     void subscribeStorageEvents();
+    // Populate m_storagePeerId / m_storageSpr / addrs via storage_module.debug().
+    void refreshStorageInfo();
     // storageUploadDone event handler completes the two-step publish flow
     // we started in runUpload.
     void handleUploadComplete(const QString& sessionId, const QString& cid);
@@ -154,6 +156,13 @@ private:
     // "in-progress" flags for the blinking start-up icons.
     bool         m_sequencerStarting = false;
     bool         m_storageStarting   = false;
+
+    // Cached storage node identity — populated after storageStart fires.
+    // Shown in a QML tooltip so the user can set up port-forwarding etc.
+    QString      m_storagePeerId;
+    QString      m_storageSpr;
+    QStringList  m_storageListenAddrs;
+    QStringList  m_storageAnnounceAddrs;
     // Reentrancy guard for configure() — stops a second concurrent configure
     // from double-initialising the modules while the first is still mid-flight.
     bool         m_configuring       = false;

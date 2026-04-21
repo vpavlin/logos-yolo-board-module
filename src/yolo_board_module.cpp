@@ -386,9 +386,27 @@ void YoloBoardModule::initStorage() {
     // (server-side is detached but its reply arrives only after), we know
     // storage is actually ready by this point — flip readiness here.
     m_storageReady = true;
+    refreshStorageInfo();
     setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
     emitStateChanged();
     ybmDiag(QStringLiteral("initStorage: m_storageReady=true (polled)"));
+}
+
+void YoloBoardModule::refreshStorageInfo() {
+    if (!m_storage) return;
+    LogosResult r = m_storage->debug();
+    if (!r.success) {
+        ybmDiag(QStringLiteral("refreshStorageInfo: debug() failed err=%1").arg(r.error.toString()));
+        return;
+    }
+    m_storagePeerId        = r.getString("id");
+    m_storageSpr           = r.getString("spr");
+    m_storageListenAddrs   = r.getValue<QStringList>("addrs");
+    m_storageAnnounceAddrs = r.getValue<QStringList>("announceAddresses");
+    ybmDiag(QStringLiteral("storage info: peer=%1 addrs=[%2] announce=[%3]")
+                .arg(m_storagePeerId)
+                .arg(m_storageListenAddrs.join(','))
+                .arg(m_storageAnnounceAddrs.join(',')));
 }
 
 // Debug: append a line to a host-visible diagnostic file. qInfo from the
@@ -421,6 +439,7 @@ void YoloBoardModule::subscribeStorageEvents() {
         // level start() failure would have been caught by our fallback polling.
         if (ok) {
             m_storageReady = true;
+            refreshStorageInfo();
             setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
             emitStateChanged();
         }
@@ -658,6 +677,12 @@ QString YoloBoardModule::get_state() {
     state["dataDir"] = m_dataDir;
     state["savedPeerId"] = m_savedPeerId;
     state["savedPeerAddrs"] = m_savedPeerAddrs;
+
+    // Storage node identity (for port-forwarding / SPR sharing).
+    state["storagePeerId"]     = m_storagePeerId;
+    state["storageSpr"]        = m_storageSpr;
+    state["storageListenAddrs"]   = QJsonArray::fromStringList(m_storageListenAddrs);
+    state["storageAnnounceAddrs"] = QJsonArray::fromStringList(m_storageAnnounceAddrs);
 
     QJsonArray channels;
     for (const QString& id : m_channelIds) {
