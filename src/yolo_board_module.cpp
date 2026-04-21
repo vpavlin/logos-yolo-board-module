@@ -1271,17 +1271,22 @@ QString YoloBoardModule::connect_storage_peer(const QString& peerId,
         if (!t.isEmpty()) addrs.append(t);
     }
 
-    if (!m_storage) return QStringLiteral("Error: storage wrapper missing");
+    if (!logosAPI) return QStringLiteral("Error: no logos api");
     qInfo() << "connect_storage_peer" << pid << addrs;
-    // Typed call — QStringList marshals natively through the generated
-    // bindings. We intentionally ignore the LogosResult (over-QRO serialization
-    // of LogosResult is broken and would always read as success=false); the
-    // actual dial is async on the server, so "accepted" is the correct
-    // optimistic UX.
-    m_storage->connect(pid, addrs);
+    // Bypass the typed wrapper for this call: StorageModule::connect's
+    // template-variadic invokeRemoteMethod wraps the QStringList with
+    // QVariant::fromValue(QStringList), which does NOT deserialize to
+    // QList<QString> on the remote replica and causes the call to hang
+    // until the 20 s QRO timeout (this is the same QStringList-serialization
+    // bug we patched earlier). Passing a QVariantList of QString works.
+    LogosAPIClient* sc = logosAPI->getClient(kStorageModuleName);
+    ybmDiag(QStringLiteral("connect_storage_peer %1 addrs=%2").arg(pid).arg(addrs.join(',')));
+    // Pass the QStringList directly (wrapped once); server side takes
+    // QList<QString>& which matches QMetaType::QStringList.
+    sc->invokeRemoteMethod(kStorageModuleName, "connect",
+                           QVariantList{ QVariant(pid), QVariant::fromValue(addrs) });
     setStatus(QStringLiteral("connect %1: accepted")
                   .arg(pid.left(12) + QStringLiteral("\u2026")));
-    ybmDiag(QStringLiteral("connect_storage_peer %1 addrs=%2").arg(pid).arg(addrs.join(',')));
 
     // Persist so we auto-dial on next start.
     m_savedPeerId = pid;
