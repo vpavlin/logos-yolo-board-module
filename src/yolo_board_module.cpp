@@ -394,7 +394,17 @@ void YoloBoardModule::initStorage() {
 
 void YoloBoardModule::refreshStorageInfo() {
     if (!m_storage) return;
+    // m_storage->debug() is sync IPC that spins a nested event loop. While
+    // it's waiting, the storageStart event, get_state polls, and the polled
+    // fallback can all re-enter this function and queue *another* debug()
+    // call on the same storage replica. In practice that piles up 40 s QRO
+    // timeouts and costs ~80 s of pure wall time on startup. Guard re-entry.
+    if (m_refreshingStorageInfo) return;
+    // Once populated, don't re-hit the wire on every caller.
+    if (!m_storagePeerId.isEmpty() && !m_storageListenAddrs.isEmpty()) return;
+    m_refreshingStorageInfo = true;
     LogosResult r = m_storage->debug();
+    m_refreshingStorageInfo = false;
     if (!r.success) {
         ybmDiag(QStringLiteral("refreshStorageInfo: debug() failed err=%1").arg(r.error.toString()));
         return;

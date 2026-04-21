@@ -131,6 +131,7 @@ private:
     // completion (avoiding the manifest-polling anti-pattern).
     StorageModule* m_storage = nullptr;
     bool            m_storageEventsBound = false;
+    bool            m_refreshingStorageInfo = false;
 
     // Pending uploads — keyed by session id returned from uploadUrl. The
     // storageUploadDone event handler completes publishing and caching.
