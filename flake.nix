@@ -12,23 +12,28 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.logos-cpp-sdk.follows = "logos-cpp-sdk";
     };
+    logos-storage-module = {
+      url = "github:logos-co/logos-storage-module";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     logos-package = {
       url = "github:logos-co/logos-package/9e3730d5c0e3ec955761c05b50e3a6047ee4030b";
     };
   };
 
-  outputs = { self, nixpkgs, logos-cpp-sdk, logos-liblogos, logos-package, ... }:
+  outputs = { self, nixpkgs, logos-cpp-sdk, logos-liblogos, logos-storage-module, logos-package, ... }:
     let
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
         pkgs = import nixpkgs { inherit system; };
         logosSdk = logos-cpp-sdk.packages.${system}.default;
         logosLiblogos = logos-liblogos.packages.${system}.default;
+        logosStorage = logos-storage-module.packages.${system}.default;
         lgxTool = logos-package.packages.${system}.lgx;
       });
     in
     {
-      packages = forAllSystems ({ pkgs, logosSdk, logosLiblogos, lgxTool }:
+      packages = forAllSystems ({ pkgs, logosSdk, logosLiblogos, logosStorage, lgxTool }:
         let
           buildInputs = [ pkgs.qt6.qtbase ];
 
@@ -48,6 +53,7 @@
 
             cmakeFlags = [
               "-DLOGOS_CPP_SDK_ROOT=${logosSdk}"
+              "-DLOGOS_STORAGE_ROOT=${logosStorage}"
               "-GNinja"
             ];
 

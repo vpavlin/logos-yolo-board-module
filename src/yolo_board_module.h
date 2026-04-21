@@ -15,6 +15,7 @@
 
 class LogosAPI;
 class LogosAPIClient;
+class StorageModule;
 
 class YoloBoardModule : public QObject, public IYoloBoardModule {
     Q_OBJECT
@@ -66,6 +67,12 @@ private:
     bool loadChannelFromFile();
     void initSequencer();
     void initStorage();
+    // Subscribes the four storage_module events we care about. Safe to call
+    // more than once — no-ops on duplicate subscribes in the SDK.
+    void subscribeStorageEvents();
+    // storageUploadDone event handler completes the two-step publish flow
+    // we started in runUpload.
+    void handleUploadComplete(const QString& sessionId, const QString& cid);
 
     // Persistence
     void loadSubscriptions();
@@ -73,7 +80,9 @@ private:
 
     // IPC helpers (to zone-sequencer and storage modules)
     QVariant zoneCall(const QString& method, const QVariantList& args = {});
-    QVariant storageCall(const QString& method, const QVariantList& args = {});
+    // storageCall() removed — use m_storage->... (typed SDK) for storage_module
+    // calls. Typed bindings marshal QStringList natively, surface LogosResult
+    // directly, and support .on(event, cb) for async completion.
 
     // Channel helpers
     static QString encodeChannelName(const QString& name);
@@ -113,7 +122,25 @@ private:
 
     // IPC clients
     LogosAPIClient* m_zoneClient = nullptr;
-    LogosAPIClient* m_storageClient = nullptr;
+
+    // Typed storage wrapper (generated from storage_module_plugin.h). Use
+    // for every storage_module call — it marshals QStringList properly,
+    // returns typed LogosResult, and exposes .on(event, cb) for async
+    // completion (avoiding the manifest-polling anti-pattern).
+    StorageModule* m_storage = nullptr;
+    bool            m_storageEventsBound = false;
+
+    // Pending uploads — keyed by session id returned from uploadUrl. The
+    // storageUploadDone event handler completes publishing and caching.
+    struct PendingUpload {
+        QString text;
+        QString filePath;
+        QString fileName;
+        QString mimeType;
+        int     fileSize = 0;
+        QString pendingMsgId;
+    };
+    QMap<QString, PendingUpload> m_pendingUploads;
 
     // State
     QString      m_dataDir;

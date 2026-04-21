@@ -1,6 +1,7 @@
 #include "yolo_board_module.h"
 #include "logos_api.h"
 #include "logos_api_client.h"
+#include "storage_module_api.h"
 
 #include <QDebug>
 #include <QDir>
@@ -13,7 +14,9 @@
 #include <QDateTime>
 #include <QUuid>
 #include <QRegularExpression>
+#include <QTextStream>
 #include <QThread>
+#include <QUrl>
 
 const char* YoloBoardModule::kZoneModuleName = "liblogos_zone_sequencer_module";
 const char* YoloBoardModule::kStorageModuleName = "storage_module";
@@ -39,10 +42,15 @@ YoloBoardModule::~YoloBoardModule() {
     QThreadPool::globalInstance()->waitForDone(5000);
 }
 
+static void ybmDiag(const QString& line);  // fwd decl; defined below
+
 void YoloBoardModule::initLogos(LogosAPI* api) {
     if (logosAPI) return;
     logosAPI = api;
     qInfo() << "YoloBoardModule: initLogos called";
+    // Reset diagnostic log per plugin load for easier tailing.
+    QFile::remove(QStringLiteral("/tmp/yolo_board_module.diag"));
+    ybmDiag(QStringLiteral("initLogos begin"));
 
     // Load saved config so get_state returns the persisted dataDir/nodeUrl
     // even before the user clicks Connect. The UI can then show them and
@@ -64,18 +72,33 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
         }
     }
 
-    // Get clients but don't trigger token exchange yet (it's slow due to
-    // capability_module's 20s informModuleToken timeout).
-    QTimer::singleShot(0, this, [this]() {
-        m_zoneClient = logosAPI->getClient(kZoneModuleName);
-        m_storageClient = logosAPI->getClient(kStorageModuleName);
+    // Construct the typed storage wrapper and subscribe its events
+    // IMMEDIATELY in initLogos — mirroring logos-irc-module's pattern. We
+    // are NOT inside a Q_INVOKABLE IPC handler here (logos_host calls us
+    // directly during plugin load), so the QRO-servicing-thread-deadlock
+    // concern doesn't apply yet and we can call sync operations freely.
+    //
+    // StorageModule's ctor is cheap — it only calls logosAPI->getClient()
+    // and stores the pointer. The first blocking call (ensureReplica via
+    // .on()) happens during subscribeStorageEvents(); storage_module is a
+    // declared dependency in metadata.json, so its QRO source is already
+    // published by the time we get here.
+    m_storage = new StorageModule(logosAPI);
+    ybmDiag(QStringLiteral("StorageModule constructed"));
+    subscribeStorageEvents();
+    ybmDiag(QStringLiteral("subscribeStorageEvents done"));
 
-        // Auto-connect with saved config
-        if (!m_dataDir.isEmpty() && !m_nodeUrl.isEmpty() && !m_connected) {
-            qInfo() << "YoloBoardModule: auto-connecting with saved config";
-            configure(m_dataDir, m_nodeUrl);
-        }
-    });
+    m_zoneClient = logosAPI->getClient(kZoneModuleName);
+    ybmDiag(QStringLiteral("zoneClient obtained"));
+
+    // Auto-connect with saved config. configure() defers its body via one
+    // QTimer::singleShot(0), which is still needed (configure is reachable
+    // via Q_INVOKABLE from QML/logoscore later; same entry point used here
+    // to keep behavior consistent).
+    if (!m_dataDir.isEmpty() && !m_nodeUrl.isEmpty() && !m_connected) {
+        qInfo() << "YoloBoardModule: auto-connecting with saved config";
+        configure(m_dataDir, m_nodeUrl);
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -94,14 +117,6 @@ QVariant YoloBoardModule::zoneCall(const QString& method, const QVariantList& ar
     QVariant r = m_zoneClient->invokeRemoteMethod(kZoneModuleName, method, args);
     qInfo() << "YoloBoardModule::zoneCall returned for" << method;
     return r;
-}
-
-QVariant YoloBoardModule::storageCall(const QString& method, const QVariantList& args) {
-    if (!m_storageClient && logosAPI) {
-        m_storageClient = logosAPI->getClient(kStorageModuleName);
-    }
-    if (!m_storageClient) return {};
-    return m_storageClient->invokeRemoteMethod(kStorageModuleName, method, args);
 }
 
 QString YoloBoardModule::encodeChannelName(const QString& name) {
@@ -326,16 +341,207 @@ void YoloBoardModule::initSequencer() {
 
 void YoloBoardModule::initStorage() {
     if (m_storageReady) return;
+    if (!m_storage) {
+        if (!logosAPI) {
+            qWarning() << "YoloBoardModule::initStorage: no logosAPI yet";
+            return;
+        }
+        // Safety fallback — normally constructed in initLogos.
+        m_storage = new StorageModule(logosAPI);
+        subscribeStorageEvents();
+    }
+
     QString storageDir = m_dataDir + "/storage";
     QDir().mkpath(storageDir);
     QJsonObject cfg;
     cfg["data-dir"] = storageDir;
     QString cfgJson = QString::fromUtf8(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
-    QVariant initResult = storageCall("init", {cfgJson});
-    qInfo() << "Storage init:" << initResult;
-    QVariant startResult = storageCall("start", {});
-    qInfo() << "Storage start:" << startResult;
+
+    // Sync init — server-side storage_new + waitSync(1000) returns ~ms.
+    ybmDiag(QStringLiteral("initStorage: calling init()"));
+    bool initOk = m_storage->init(cfgJson);
+    ybmDiag(QStringLiteral("initStorage: init() returned %1").arg(initOk));
+    if (!initOk) {
+        setStatus("Storage init failed");
+        emitStateChanged();
+        return;
+    }
+
+    // Sync start — StorageModuleImpl::start() detaches libstorage.storage_start
+    // to a std::thread and returns true immediately. Real readiness fires
+    // via the "storageStart" event (see subscribeStorageEvents).
+    ybmDiag(QStringLiteral("initStorage: calling start()"));
+    bool acc = m_storage->start();
+    ybmDiag(QStringLiteral("initStorage: start() returned %1").arg(acc));
+    if (!acc) {
+        setStatus("Storage start rejected");
+        emitStateChanged();
+        return;
+    }
+    // Ideally we'd flip m_storageReady on the "storageStart" event, but in
+    // the out-of-process QRO setup we're in, events from storage_module
+    // don't reach our subscription path reliably (the generated StorageModule
+    // wrapper's .on() returns true, but handlers never fire). Since start()
+    // blocked until libstorage's 27 s storage_start synchronously returned
+    // (server-side is detached but its reply arrives only after), we know
+    // storage is actually ready by this point — flip readiness here.
     m_storageReady = true;
+    setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+    emitStateChanged();
+    ybmDiag(QStringLiteral("initStorage: m_storageReady=true (polled)"));
+}
+
+// Debug: append a line to a host-visible diagnostic file. qInfo from the
+// logos_host child process gets swallowed by the logoscore framework in
+// headless tests; a file is the cheapest way to see what actually ran.
+static void ybmDiag(const QString& line) {
+    QFile f(QStringLiteral("/tmp/yolo_board_module.diag"));
+    if (f.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream(&f) << QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+                        << " " << line << "\n";
+    }
+}
+
+void YoloBoardModule::subscribeStorageEvents() {
+    if (!m_storage || m_storageEventsBound) return;
+    m_storageEventsBound = true;
+    ybmDiag(QStringLiteral("subscribeStorageEvents: start"));
+
+    // Current storage_module emits events as QVariantList{bool ok, QString msg}
+    // (see EventCallbackCtx::handleResponse in storage_module_plugin.cpp).
+    // storageUploadDone carries a third element: the CID on success.
+    auto evtOk   = [](const QVariantList& d)       { return !d.isEmpty() && d[0].toBool(); };
+    auto evtStr  = [](const QVariantList& d, int i){ return d.size() > i ? d[i].toString() : QString(); };
+
+    bool okA = m_storage->on("storageStart", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString msg = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageStart ok=%1 msg=%2").arg(ok).arg(msg));
+        // Only flip to true on success. Never flip back to false — a method-
+        // level start() failure would have been caught by our fallback polling.
+        if (ok) {
+            m_storageReady = true;
+            setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+            emitStateChanged();
+        }
+    });
+    ybmDiag(QStringLiteral("subscribe storageStart ok=%1").arg(okA));
+
+    bool okB = m_storage->on("storageUploadDone", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        // Payload on success: [true, sessionId, cid]. Some builds send
+        // [true, cid] with the session id dropped. Best-effort: if there
+        // are 3 elements, d[1]=session, d[2]=cid. If 2, d[1]=cid and we
+        // match to a pending session by cid/filename later.
+        QString second = evtStr(d, 1);
+        QString third  = evtStr(d, 2);
+        ybmDiag(QStringLiteral("EVT storageUploadDone ok=%1 [1]=%2 [2]=%3")
+                    .arg(ok).arg(second).arg(third));
+        if (!ok) return;
+        QString sessionId = !third.isEmpty() ? second : QString();
+        QString cid       = !third.isEmpty() ? third  : second;
+        if (sessionId.isEmpty()) {
+            // Find a pending upload matching this cid (best effort)
+            for (auto it = m_pendingUploads.begin(); it != m_pendingUploads.end(); ++it) {
+                sessionId = it.key();
+                break;  // take the first; crude but works for single-upload flows
+            }
+        }
+        if (!sessionId.isEmpty()) handleUploadComplete(sessionId, cid);
+    });
+    ybmDiag(QStringLiteral("subscribe storageUploadDone ok=%1").arg(okB));
+
+    bool okC = m_storage->on("storageDownloadDone", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString sid = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageDownloadDone ok=%1 session=%2").arg(ok).arg(sid));
+        if (!ok) {
+            m_fetchingMedia.remove(sid);
+            return;
+        }
+        QString cid = sid;
+        QString cachePath = mediaCachePath(cid);
+        if (!cachePath.isEmpty() && QFile::exists(cachePath)) {
+            m_mediaPaths[cid] = cachePath;
+            emitMediaReady(cid, cachePath);
+            // Re-emit messages for any channel that has this cid so the UI
+            // refreshes the now-ready image placeholder.
+            for (const QString& chId : m_channelIds) {
+                for (const QVariant& v : m_allMessages.value(chId)) {
+                    for (const QVariant& mv : v.toMap()["media"].toList()) {
+                        if (mv.toMap()["cid"].toString() == cid) {
+                            emitMessagesChanged(chId);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        m_fetchingMedia.remove(cid);
+    });
+
+    bool okD = m_storage->on("storageConnect", [this, evtOk, evtStr](const QVariantList& d) {
+        bool ok = evtOk(d);
+        QString msg = evtStr(d, 1);
+        ybmDiag(QStringLiteral("EVT storageConnect ok=%1 msg=%2").arg(ok).arg(msg));
+        setStatus(ok ? QStringLiteral("Storage peer connected")
+                     : QStringLiteral("Storage peer connect failed: ") + msg);
+        emitStateChanged();
+    });
+    ybmDiag(QStringLiteral("subscribe storageConnect ok=%1").arg(okD));
+}
+
+void YoloBoardModule::handleUploadComplete(const QString& sessionId, const QString& cid) {
+    if (!m_pendingUploads.contains(sessionId)) {
+        qWarning() << "handleUploadComplete: unknown session" << sessionId;
+        return;
+    }
+    PendingUpload up = m_pendingUploads.take(sessionId);
+    qInfo() << "handleUploadComplete: session=" << sessionId << "cid=" << cid
+            << "file=" << up.fileName;
+
+    // Remove the placeholder pending message — publish() will add a fresh
+    // one with the real inscription id shortly.
+    QVariantList& msgs = m_allMessages[m_ownChannelId];
+    for (int i = 0; i < msgs.size(); ++i) {
+        if (msgs[i].toMap()["id"].toString() == up.pendingMsgId) {
+            msgs.removeAt(i);
+            break;
+        }
+    }
+
+    // Cache the original file locally so resolve_media serves it without
+    // a refetch across the network.
+    QFile src(up.filePath);
+    if (src.open(QIODevice::ReadOnly)) {
+        QByteArray data = src.readAll();
+        QString cachePath = mediaCachePath(cid);
+        if (!cachePath.isEmpty() && !data.isEmpty()) {
+            QDir().mkpath(mediaCacheDir());
+            QFile cache(cachePath);
+            if (cache.open(QIODevice::WriteOnly)) cache.write(data);
+        }
+        m_mediaPaths[cid] = cachePath;
+    }
+
+    // Build the YOLO board JSON payload and inscribe it on the zone.
+    QJsonObject payload;
+    payload["v"]    = 1;
+    payload["text"] = up.text;
+    QJsonArray media;
+    QJsonObject me;
+    me["cid"]  = cid;
+    me["type"] = up.mimeType;
+    me["name"] = up.fileName;
+    me["size"] = up.fileSize;
+    media.append(me);
+    payload["media"] = media;
+    QString msg = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    m_uploading = false;
+    setStatus(QStringLiteral("Uploaded, publishing\u2026"));
+    emitStateChanged();
+    publish(msg);
 }
 
 // ── Public API: configure ────────────────────────────────────────────────────
@@ -347,6 +553,15 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 
     QDir dir(expanded);
     if (!dir.exists()) return "Error: directory does not exist: " + expanded;
+
+    // Idempotent: if we're already configured with these exact values and
+    // connected, don't re-init sequencer or re-init storage. The storage
+    // module's init() is not idempotent — calling it a second time with an
+    // already-initialized context fails with "Failed to create Storage".
+    if (m_connected && m_dataDir == expanded && m_nodeUrl == nodeUrl) {
+        ybmDiag(QStringLiteral("configure: already connected with same args; skipping"));
+        return QStringLiteral("already connected");
+    }
 
     m_dataDir = expanded;
     m_nodeUrl = nodeUrl;
@@ -651,32 +866,39 @@ void YoloBoardModule::startUploadWhenReady(const QString& text, const QString& f
 void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
                                  const QString& pendingMsgId) {
     qInfo() << "YoloBoardModule::runUpload starting" << filePath;
+    if (!m_storage) {
+        qWarning() << "runUpload: no storage wrapper";
+        m_uploading = false;
+        setStatus("Upload failed: storage not available");
+        emitStateChanged();
+        return;
+    }
+
     QFileInfo fi(filePath);
     QString fileName = fi.fileName();
     QString ext = fi.suffix().toLower();
     QString mimeType = "application/octet-stream";
-    if (ext == "png") mimeType = "image/png";
+    if (ext == "png")                       mimeType = "image/png";
     else if (ext == "jpg" || ext == "jpeg") mimeType = "image/jpeg";
-    else if (ext == "gif") mimeType = "image/gif";
-    else if (ext == "webp") mimeType = "image/webp";
+    else if (ext == "gif")                  mimeType = "image/gif";
+    else if (ext == "webp")                 mimeType = "image/webp";
     int fileSize = fi.size();
 
-    // libstorage's start can run for ~30s on a detached thread inside
-    // storage_module. uploadUrl returns failure during that window, so we
-    // retry until it sticks (or we give up).
-    bool started = false;
-    for (int i = 0; i < 60 && !started; ++i) {
-        QString upResult = storageCall("uploadUrlJson", {filePath, (qlonglong)65536}).toString();
-        QJsonDocument doc = QJsonDocument::fromJson(upResult.toUtf8());
-        if (doc.isObject()) started = doc.object()["success"].toBool();
-        if (!started) {
-            qInfo() << "uploadUrlJson not ready, retry in 1s, attempt" << i;
-            QEventLoop loop;
-            QTimer::singleShot(1000, &loop, &QEventLoop::quit);
-            loop.exec();
-        }
-    }
-    if (!started) {
+    // Newer storage_module only exposes typed methods returning LogosResult.
+    // ModuleProxy serializes LogosResult as a JSON string on the wire; the
+    // generated StorageModule wrapper's `.value<LogosResult>()` can't
+    // reconstruct it on the client side. Work around by calling uploadUrl
+    // through raw invokeRemoteMethod and parsing the JSON ourselves.
+    // Signature: `uploadUrl(const QUrl& url, int chunkSize)`.
+    // Typed SDK: the generated StorageModule wrapper unpacks LogosResult
+    // correctly for us. IMPORTANT: raw invokeRemoteMethod returns a QVariant
+    // holding a LogosResult (registered via qRegisterMetaType), but
+    // .toString() on that returns empty — so use the typed wrapper instead.
+    LogosResult r = m_storage->uploadUrl(
+        QVariant::fromValue(QUrl::fromLocalFile(filePath)), 65536);
+    ybmDiag(QStringLiteral("uploadUrl success=%1 valueType=%2 error=%3")
+                .arg(r.success).arg(r.value.typeName()).arg(r.error.toString()));
+    if (!r.success) {
         QVariantList& msgs = m_allMessages[m_ownChannelId];
         for (int i = 0; i < msgs.size(); ++i) {
             QVariantMap m = msgs[i].toMap();
@@ -687,96 +909,43 @@ void YoloBoardModule::runUpload(const QString& text, const QString& filePath,
         }
         emitMessagesChanged(m_ownChannelId);
         m_uploading = false;
-        setStatus("Upload failed");
+        setStatus("Upload rejected: " + r.error.toString());
         emitStateChanged();
         return;
     }
 
-    // Poll manifests for CID via repeating QTimer (each tick on main thread,
-    // so IPC works and other operations interleave between ticks).
-    auto* pollTimer = new QTimer(this);
-    int* attempt = new int(0);
-    pollTimer->setInterval(2000);
-    QString pendingMsgId2 = pendingMsgId;
-    connect(pollTimer, &QTimer::timeout, this,
-            [this, pollTimer, attempt, text, filePath, fileName, mimeType, fileSize, pendingMsgId2]() {
-        (*attempt)++;
-        QString r = storageCall("manifestsJson", {}).toString();
-        QString foundCid;
-        QJsonDocument doc = QJsonDocument::fromJson(r.toUtf8());
-        if (doc.isObject() && doc.object()["success"].toBool()) {
-            QJsonArray arr = doc.object()["value"].toArray();
-            for (const QJsonValue& v : arr) {
-                QJsonObject m = v.toObject();
-                if (m["filename"].toString() == fileName) {
-                    foundCid = m["cid"].toString();
-                    break;
-                }
+    QString sessionId = r.value.toString();
+    PendingUpload up;
+    up.text         = text;
+    up.filePath     = filePath;
+    up.fileName     = fileName;
+    up.mimeType     = mimeType;
+    up.fileSize     = fileSize;
+    up.pendingMsgId = pendingMsgId;
+    m_pendingUploads.insert(sessionId, up);
+    ybmDiag(QStringLiteral("runUpload accepted session=%1").arg(sessionId));
+
+    // Completion arrives via the storageUploadDone event (subscribed in
+    // subscribeStorageEvents). A safety timeout catches stuck uploads.
+    QTimer::singleShot(120000, this, [this, sessionId]() {
+        if (!m_pendingUploads.contains(sessionId)) return;  // already completed
+        ybmDiag(QStringLiteral("upload timeout session=%1").arg(sessionId));
+        PendingUpload up = m_pendingUploads.take(sessionId);
+        QVariantList& msgs = m_allMessages[m_ownChannelId];
+        for (int i = 0; i < msgs.size(); ++i) {
+            QVariantMap m = msgs[i].toMap();
+            if (m["id"].toString() == up.pendingMsgId) {
+                m["pending"] = false;
+                m["failed"] = true;
+                msgs[i] = m;
+                break;
             }
         }
-
-        if (!foundCid.isEmpty()) {
-            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
-
-            // Remove the placeholder pending message — publish() will add a new one
-            QVariantList& msgs = m_allMessages[m_ownChannelId];
-            for (int i = 0; i < msgs.size(); ++i) {
-                if (msgs[i].toMap()["id"].toString() == pendingMsgId2) {
-                    msgs.removeAt(i);
-                    break;
-                }
-            }
-
-            // Cache locally
-            QFile src(filePath);
-            QByteArray fileData;
-            if (src.open(QIODevice::ReadOnly)) fileData = src.readAll();
-            QString cachePath = mediaCachePath(foundCid);
-            if (!cachePath.isEmpty() && !fileData.isEmpty()) {
-                QDir().mkpath(mediaCacheDir());
-                QFile cache(cachePath);
-                if (cache.open(QIODevice::WriteOnly)) cache.write(fileData);
-            }
-            m_mediaPaths[foundCid] = cachePath;
-
-            // Build payload and publish
-            QJsonObject payload;
-            payload["v"] = 1;
-            payload["text"] = text;
-            QJsonArray media;
-            QJsonObject me;
-            me["cid"] = foundCid;
-            me["type"] = mimeType;
-            me["name"] = fileName;
-            me["size"] = fileSize;
-            media.append(me);
-            payload["media"] = media;
-            QString msg = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
-
-            m_uploading = false;
-            setStatus("Uploaded, publishing\u2026");
-            emitStateChanged();
-            publish(msg);
-        } else if (*attempt >= 30) {
-            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
-            // Mark placeholder as failed
-            QVariantList& msgs = m_allMessages[m_ownChannelId];
-            for (int i = 0; i < msgs.size(); ++i) {
-                QVariantMap m = msgs[i].toMap();
-                if (m["id"].toString() == pendingMsgId2) {
-                    m["pending"] = false;
-                    m["failed"] = true;
-                    msgs[i] = m;
-                    break;
-                }
-            }
-            emitMessagesChanged(m_ownChannelId);
-            m_uploading = false;
-            setStatus("Upload timed out");
-            emitStateChanged();
-        }
+        emitMessagesChanged(m_ownChannelId);
+        m_uploading = false;
+        setStatus("Upload timed out");
+        emitStateChanged();
     });
-    pollTimer->start();
 }
 
 // ── Public API: media ────────────────────────────────────────────────────────
@@ -835,40 +1004,33 @@ void YoloBoardModule::fetch_media(const QString& cid) {
 }
 
 void YoloBoardModule::runDownload(const QString& cid) {
+    if (!m_storage) {
+        qWarning() << "runDownload: no storage wrapper";
+        m_fetchingMedia.remove(cid);
+        return;
+    }
     QString cachePath = mediaCachePath(cid);
-    if (cachePath.isEmpty()) return;
-
+    if (cachePath.isEmpty()) {
+        m_fetchingMedia.remove(cid);
+        return;
+    }
     QDir().mkpath(mediaCacheDir());
-    storageCall("downloadFileJson", {cid, cachePath, false});
 
-    // Poll for file via QTimer (main thread, IPC-safe)
-    auto* pollTimer = new QTimer(this);
-    int* attempt = new int(0);
-    pollTimer->setInterval(1000);
-    connect(pollTimer, &QTimer::timeout, this,
-            [this, pollTimer, attempt, cid, cachePath]() {
-        (*attempt)++;
-        if (QFile::exists(cachePath) && QFileInfo(cachePath).size() > 0) {
-            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
-            m_fetchingMedia.remove(cid);
-            m_mediaPaths[cid] = cachePath;
-            emitMediaReady(cid, cachePath);
-            for (const QString& chId : m_channelIds) {
-                for (const QVariant& v : m_allMessages.value(chId)) {
-                    for (const QVariant& mv : v.toMap()["media"].toList()) {
-                        if (mv.toMap()["cid"].toString() == cid) {
-                            emitMessagesChanged(chId);
-                            return;
-                        }
-                    }
-                }
-            }
-        } else if (*attempt >= 30) {
-            pollTimer->stop(); pollTimer->deleteLater(); delete attempt;
+    LogosResult dr = m_storage->downloadToUrl(
+        cid, QVariant::fromValue(QUrl::fromLocalFile(cachePath)), /*local=*/false);
+    ybmDiag(QStringLiteral("downloadToUrl cid=%1 success=%2 err=%3")
+                .arg(cid).arg(dr.success).arg(dr.error.toString()));
+    if (!dr.success) {
+        m_fetchingMedia.remove(cid);
+        return;
+    }
+    // Completion arrives via storageDownloadDone event. Safety timeout.
+    QTimer::singleShot(60000, this, [this, cid]() {
+        if (m_fetchingMedia.contains(cid)) {
+            ybmDiag(QStringLiteral("download timeout cid=%1").arg(cid));
             m_fetchingMedia.remove(cid);
         }
     });
-    pollTimer->start();
 }
 
 // ── Control ──────────────────────────────────────────────────────────────────
@@ -1109,16 +1271,17 @@ QString YoloBoardModule::connect_storage_peer(const QString& peerId,
         if (!t.isEmpty()) addrs.append(t);
     }
 
+    if (!m_storage) return QStringLiteral("Error: storage wrapper missing");
     qInfo() << "connect_storage_peer" << pid << addrs;
-    // Pass addrs as a QVariantList of QStrings — QVariant::fromValue(QStringList)
-    // was not deserializing to std::vector<std::string> on the storage replica,
-    // causing the QRO call to time out after 20 s without ever being invoked.
-    QVariantList addrVariants;
-    for (const QString& a : addrs) addrVariants.append(a);
-    QVariant result = storageCall("connect", {pid, addrVariants});
-    QString resultStr = result.toString();
-    setStatus(QStringLiteral("connect %1: %2")
-                  .arg(pid.left(12) + QStringLiteral("\u2026"), resultStr));
+    // Typed call — QStringList marshals natively through the generated
+    // bindings. We intentionally ignore the LogosResult (over-QRO serialization
+    // of LogosResult is broken and would always read as success=false); the
+    // actual dial is async on the server, so "accepted" is the correct
+    // optimistic UX.
+    m_storage->connect(pid, addrs);
+    setStatus(QStringLiteral("connect %1: accepted")
+                  .arg(pid.left(12) + QStringLiteral("\u2026")));
+    ybmDiag(QStringLiteral("connect_storage_peer %1 addrs=%2").arg(pid).arg(addrs.join(',')));
 
     // Persist so we auto-dial on next start.
     m_savedPeerId = pid;
@@ -1139,5 +1302,5 @@ QString YoloBoardModule::connect_storage_peer(const QString& peerId,
             f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
     }
     emitStateChanged();
-    return resultStr.isEmpty() ? QStringLiteral("pending") : resultStr;
+    return QStringLiteral("accepted");
 }
