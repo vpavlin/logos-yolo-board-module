@@ -607,6 +607,21 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     m_sequencerStarting = true;
     m_storageStarting   = true;
     setStatus("Connecting & starting storage\u2026");
+
+    // Pre-load cached messages off disk BEFORE the 40-60 s sequencer init.
+    // If we know our channel id from channel.id on disk, we can render cached
+    // channels + messages immediately — user sees content in <1 s instead of
+    // staring at an empty board for a minute. The sequencer catches up later
+    // via the poll timer once it's connected.
+    if (!m_ownChannelId.isEmpty()) {
+        if (!m_channelIds.contains(m_ownChannelId))
+            m_channelIds.prepend(m_ownChannelId);
+        loadCacheForChannel(m_ownChannelId);
+        loadSubscriptions();  // also populates caches for subscribed channels
+        emitChannelsChanged();
+        emitMessagesChanged(m_ownChannelId);
+    }
+
     emitStateChanged();
 
     // Both initSequencer() and initStorage() do slow sync IPC to separate
@@ -631,11 +646,16 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
             return;
         }
 
+        // In case configure() didn't have a cached channel id on disk and
+        // the sequencer just resolved it, hydrate now. Both loads are
+        // idempotent (maps keyed by channel id), so it's safe to call
+        // again even if configure() already pre-loaded.
         if (!m_channelIds.contains(m_ownChannelId))
             m_channelIds.prepend(m_ownChannelId);
-
-        loadCacheForChannel(m_ownChannelId);
-        loadSubscriptions();
+        if (!m_allMessages.contains(m_ownChannelId))
+            loadCacheForChannel(m_ownChannelId);
+        if (m_channelIds.size() <= 1)
+            loadSubscriptions();
 
         m_connected = true;
         setStatus(m_storageReady
