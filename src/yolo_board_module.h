@@ -151,6 +151,12 @@ private:
     bool         m_connected = false;
     bool         m_storageReady = false;
     bool         m_uploading = false;
+    // "in-progress" flags for the blinking start-up icons.
+    bool         m_sequencerStarting = false;
+    bool         m_storageStarting   = false;
+    // Reentrancy guard for configure() — stops a second concurrent configure
+    // from double-initialising the modules while the first is still mid-flight.
+    bool         m_configuring       = false;
 
     QString      m_uiDir;
 

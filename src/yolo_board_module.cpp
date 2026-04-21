@@ -554,10 +554,15 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     QDir dir(expanded);
     if (!dir.exists()) return "Error: directory does not exist: " + expanded;
 
-    // Idempotent: if we're already configured with these exact values and
-    // connected, don't re-init sequencer or re-init storage. The storage
-    // module's init() is not idempotent — calling it a second time with an
-    // already-initialized context fails with "Failed to create Storage".
+    // Idempotent: if we're already configured with these exact values, or
+    // configure is mid-flight, don't kick off another round. storage_module's
+    // init() is not idempotent — a second call with an already-initialized
+    // context fails with "Failed to create Storage", and two concurrent
+    // initSequencer calls also race.
+    if (m_configuring) {
+        ybmDiag(QStringLiteral("configure: already configuring; skipping"));
+        return QStringLiteral("configuring");
+    }
     if (m_connected && m_dataDir == expanded && m_nodeUrl == nodeUrl) {
         ybmDiag(QStringLiteral("configure: already connected with same args; skipping"));
         return QStringLiteral("already connected");
@@ -569,17 +574,30 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     if (!loadKeyFromFile()) return "Error: cannot read sequencer.key in " + expanded;
     loadChannelFromFile();  // optional — can be derived
 
-    setStatus("Connecting\u2026");
+    m_configuring = true;
+    m_sequencerStarting = true;
+    m_storageStarting   = true;
+    setStatus("Connecting & starting storage\u2026");
     emitStateChanged();
 
-    // Must return immediately — if we block here calling zoneCall, main thread
-    // can't process the IPC response, causing deadlock. Defer work to next
-    // event loop iteration.
+    // Both initSequencer() and initStorage() do slow sync IPC to separate
+    // host processes — no shared state between them. Kick them off in
+    // parallel via two independent QTimer::singleShots scheduled back-to-back.
+    // Qt's Remote Objects sync calls spin a nested event loop while waiting
+    // for the reply, so the second singleShot fires during the first's wait
+    // and both IPC calls run concurrently on their respective host processes.
+    // Net: configure now completes in max(sequencer, storage) instead of their
+    // sum (historically ~80 s sequential → ~50 s parallel).
+
     QTimer::singleShot(0, this, [this]() {
+        ybmDiag(QStringLiteral("configure: initSequencer begin"));
         initSequencer();
+        m_sequencerStarting = false;
+        ybmDiag(QStringLiteral("configure: initSequencer done ownChannel=%1").arg(m_ownChannelId));
 
         if (m_ownChannelId.isEmpty() || m_ownChannelId.startsWith("Error:")) {
             setStatus("Error: could not determine channel ID");
+            if (!m_storageStarting) m_configuring = false;
             emitStateChanged();
             return;
         }
@@ -591,7 +609,9 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
         loadSubscriptions();
 
         m_connected = true;
-        setStatus("Connected to " + m_nodeUrl);
+        setStatus(m_storageReady
+                      ? QStringLiteral("Connected to ") + m_nodeUrl
+                      : QStringLiteral("Sequencer connected; storage starting…"));
 
         // Save config for next launch
         QJsonObject cfg;
@@ -603,22 +623,20 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 
         m_pollTimer->start();
         emitChannelsChanged();
+        if (!m_storageStarting) m_configuring = false;
         emitStateChanged();
+    });
 
-        // Kick off storage init immediately. storage.start() can take 20-30s
-        // (discovery + transport bind), so the sooner we begin the better.
-        QTimer::singleShot(0, this, [this]() {
-            setStatus("Starting storage…");
-            emitStateChanged();
-            initStorage();
-            setStatus("Connected to " + m_nodeUrl);
-            emitStateChanged();
-
-            // Previously we auto-dialed the saved peer here, but the
-            // synchronous storageCall("connect", ...) serializes with
-            // uploadUrl on the QRO channel and stalls the first publish.
-            // Let the user click Connect manually — fields are pre-filled.
-        });
+    QTimer::singleShot(0, this, [this]() {
+        ybmDiag(QStringLiteral("configure: initStorage begin"));
+        initStorage();
+        m_storageStarting = false;
+        ybmDiag(QStringLiteral("configure: initStorage done storageReady=%1").arg(m_storageReady));
+        if (m_connected) {
+            setStatus(QStringLiteral("Connected to ") + m_nodeUrl);
+        }
+        if (!m_sequencerStarting) m_configuring = false;
+        emitStateChanged();
     });
 
     return "pending";
@@ -630,6 +648,8 @@ QString YoloBoardModule::get_state() {
     QJsonObject state;
     state["connected"] = m_connected;
     state["storageReady"] = m_storageReady;
+    state["sequencerStarting"] = m_sequencerStarting;
+    state["storageStarting"]   = m_storageStarting;
     state["uploading"] = m_uploading;
     state["status"] = m_status;
     state["ownChannelId"] = m_ownChannelId;
