@@ -664,6 +664,13 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
 // ── Public API: state snapshots ──────────────────────────────────────────────
 
 QString YoloBoardModule::get_state() {
+    // Lazy refresh: the first refreshStorageInfo() right after storageStart
+    // sometimes gets empty strings back because the storage node is still
+    // settling (peer id / SPR get published a few hundred ms after the event
+    // fires). Retry on every get_state poll until we have real data.
+    if (m_storage && m_storageReady && m_storagePeerId.isEmpty()) {
+        refreshStorageInfo();
+    }
     QJsonObject state;
     state["connected"] = m_connected;
     state["storageReady"] = m_storageReady;
