@@ -1,8 +1,10 @@
 #include "yolo_board_module.h"
 #include "logos_api.h"
 #include "logos_api_client.h"
+#include "logos_object.h"
 #include "storage_module_api.h"
 
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QDir>
 #include <QEventLoop>
@@ -20,6 +22,7 @@
 
 const char* YoloBoardModule::kZoneModuleName = "liblogos_zone_sequencer_module";
 const char* YoloBoardModule::kStorageModuleName = "storage_module";
+const char* YoloBoardModule::kDeliveryModuleName = "delivery_module";
 
 static QString uiConfigPath() {
     QString dir = QDir::homePath() + "/.config/logos";
@@ -87,6 +90,19 @@ void YoloBoardModule::initLogos(LogosAPI* api) {
     ybmDiag(QStringLiteral("StorageModule constructed"));
     subscribeStorageEvents();
     ybmDiag(QStringLiteral("subscribeStorageEvents done"));
+
+    // Delivery (Waku pub/sub) — we use raw QRO IPC, no typed wrapper (see
+    // comment in header). The client pointer is cheap to acquire; the
+    // replica that carries events is acquired lazily in
+    // subscribeDeliveryEvents since requestObject() can block briefly.
+    m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+    ybmDiag(QStringLiteral("deliveryClient obtained=%1").arg(m_deliveryClient != nullptr));
+    subscribeDeliveryEvents();
+    ybmDiag(QStringLiteral("subscribeDeliveryEvents done"));
+
+    // Load persisted "My threads" list so the UI can render it immediately.
+    // These are NOT auto-resubscribed — user rejoins manually.
+    loadParticipatedThreads();
 
     m_zoneClient = logosAPI->getClient(kZoneModuleName);
     ybmDiag(QStringLiteral("zoneClient obtained"));
@@ -573,6 +589,543 @@ void YoloBoardModule::handleUploadComplete(const QString& sessionId, const QStri
     publish(msg);
 }
 
+// ── Delivery (Waku pub/sub) ──────────────────────────────────────────────────
+
+static bool deliveryBoolResult(const QVariant& r) {
+    // delivery_module's Q_INVOKABLE methods return LogosResult; over QRO
+    // that lands as a QVariant wrapping a LogosResult. Extract the bool.
+    if (r.canConvert<LogosResult>()) return r.value<LogosResult>().success;
+    return r.toBool();
+}
+
+static QString deliveryStringResult(const QVariant& r) {
+    // Extract the string payload from a LogosResult (requestId on send).
+    if (r.canConvert<LogosResult>()) {
+        LogosResult lr = r.value<LogosResult>();
+        return lr.success ? lr.value.toString() : QString();
+    }
+    return r.toString();
+}
+
+void YoloBoardModule::subscribeDeliveryEvents() {
+    if (m_deliveryEventsBound) return;
+    if (!m_deliveryClient) {
+        if (!logosAPI) return;
+        m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+    }
+    if (!m_deliveryClient) return;
+    // Acquire the replica that carries the plugin's event channel. This
+    // blocks briefly (QRO sync) but delivery_module is a declared dep so
+    // its replica is published by the time we get here.
+    if (!m_deliveryReplica) {
+        m_deliveryReplica = m_deliveryClient->requestObject(kDeliveryModuleName);
+        if (!m_deliveryReplica) {
+            ybmDiag(QStringLiteral("subscribeDeliveryEvents: requestObject failed"));
+            return;
+        }
+    }
+    m_deliveryEventsBound = true;
+    ybmDiag(QStringLiteral("subscribeDeliveryEvents: start"));
+
+    auto evtStr = [](const QVariantList& d, int i){
+        return d.size() > i ? d[i].toString() : QString();
+    };
+
+    // messageReceived: [message_hash, content_topic, payload_b64, timestamp_ns]
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageReceived"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString topic   = evtStr(d, 1);
+            QString payload = evtStr(d, 2);
+            quint64 ts      = d.size() > 3 ? d[3].toString().toULongLong() : 0;
+            ybmDiag(QStringLiteral("EVT messageReceived topic=%1").arg(topic));
+            onThreadMessageReceived(topic, payload, ts);
+        });
+
+    // connectionStateChanged: [status, timestamp]. "connected" flips readiness.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("connectionStateChanged"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString status = evtStr(d, 0);
+            bool connected = (status.compare(QStringLiteral("connected"), Qt::CaseInsensitive) == 0);
+            ybmDiag(QStringLiteral("EVT connectionStateChanged status=%1 connected=%2")
+                        .arg(status).arg(connected));
+            if (connected && !m_deliveryReady) {
+                m_deliveryReady = true;
+                m_deliveryStarting = false;
+                emitStateChanged();
+            } else if (!connected && m_deliveryReady) {
+                m_deliveryReady = false;
+                emitStateChanged();
+            }
+        });
+
+    // messageSent: [request_id, message_hash, timestamp]. The Waku relay has
+    // accepted our message. We already cleared `pending` on the immediate
+    // send-reply, so the additional signal here is `confirmed = true` —
+    // surfaced as a "delivered ✓" indicator in the UI to prove the message
+    // actually left our node and was acknowledged by at least one peer.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageSent"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            ybmDiag(QStringLiteral("EVT messageSent req=%1").arg(reqId));
+            QVariantMap ref = m_threadPendingById.take(reqId);
+            if (ref.isEmpty()) return;
+            QString topic    = ref.value("topic").toString();
+            QString localId  = ref.value("localMsgId").toString();
+            QVariantList& buf = m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() == localId) {
+                    m["pending"]   = false;
+                    m["failed"]    = false;
+                    m["confirmed"] = true;
+                    buf[i] = m;
+                    emitThreadMessagesChanged(topic);
+                    break;
+                }
+            }
+        });
+
+    // messageError: flip failed=true on matching local message.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messageError"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            QString err   = evtStr(d, 2);
+            ybmDiag(QStringLiteral("EVT messageError req=%1 err=%2").arg(reqId).arg(err));
+            QVariantMap ref = m_threadPendingById.take(reqId);
+            if (ref.isEmpty()) return;
+            QString topic    = ref.value("topic").toString();
+            QString localId  = ref.value("localMsgId").toString();
+            QVariantList& buf = m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() == localId) {
+                    m["pending"] = false;
+                    m["failed"]  = true;
+                    buf[i] = m;
+                    emitThreadMessagesChanged(topic);
+                    break;
+                }
+            }
+        });
+
+    // messagePropagated: informational; pending flag is cleared by messageSent.
+    m_deliveryClient->onEvent(m_deliveryReplica, QStringLiteral("messagePropagated"),
+        [this, evtStr](const QString&, const QVariantList& d) {
+            QString reqId = evtStr(d, 0);
+            ybmDiag(QStringLiteral("EVT messagePropagated req=%1").arg(reqId));
+        });
+}
+
+void YoloBoardModule::initDelivery() {
+    // Only guard on readiness — m_deliveryStarting is pre-set in configure()
+    // so the UI can blink the icon from t=0 (otherwise there's a millisecond
+    // window where starting=false and the animation doesn't run).
+    if (m_deliveryReady) return;
+    if (!m_deliveryClient) {
+        if (!logosAPI) return;
+        m_deliveryClient = logosAPI->getClient(kDeliveryModuleName);
+        if (!m_deliveryClient) {
+            setStatus(QStringLiteral("Delivery client unavailable"));
+            return;
+        }
+        subscribeDeliveryEvents();
+    }
+
+    QString deliveryDir = m_dataDir + "/delivery";
+    QDir().mkpath(deliveryDir);
+
+    // Minimal Waku config. `preset: "logos.dev"` populates cluster ID,
+    // bootstrap peers, RLN etc for the default Logos dev network. If the
+    // user wants a specific network they can drop delivery-config.json in
+    // dataDir; we'll pick that up verbatim.
+    QJsonObject cfg;
+    // Core mode + relay: without relay the node is a filter/lightpush client
+    // and subscribe() waits for a peer that serves those protocols — the
+    // logos.dev entry nodes don't, so subscribe blocks its 30 s timeout and
+    // returns false. As a relay node we join the pubsub shard directly and
+    // messages flow as soon as any relay peer is dialed.
+    cfg["mode"] = "Core";
+    cfg["relay"] = true;
+    cfg["preset"] = "logos.dev";
+    cfg["logLevel"] = "INFO";
+    // Waku defaults (TCP 60000 / UDP 9000) commonly collide with other
+    // developer tooling (VS Code code-tunnel grabs 60000, various local
+    // services want 9000), causing START_NODE to fail with "Address
+    // already in use". Pick non-default ports and let the user override
+    // via delivery-config.json if they need something specific.
+    cfg["tcpPort"] = 61000;
+    cfg["discv5UdpPort"] = 9009;
+    {
+        QFile override(m_dataDir + "/delivery-config.json");
+        if (override.open(QIODevice::ReadOnly)) {
+            QJsonDocument od = QJsonDocument::fromJson(override.readAll());
+            if (od.isObject()) cfg = od.object();
+        }
+    }
+    QString cfgJson = QString::fromUtf8(QJsonDocument(cfg).toJson(QJsonDocument::Compact));
+
+    // Default QRO client timeout is 20s. delivery_module's createNode
+    // spins up a Waku node (bearssl init, libp2p, rendezvous bootstrap)
+    // and routinely takes 20–40s; start() is similar. Bump to 90s so the
+    // sync reply actually reaches us instead of timing out client-side.
+    // (The module's own CALLBACK_TIMEOUT is 30s, so we're still bounded.)
+    Timeout deliveryTimeout{90000};
+    ybmDiag(QStringLiteral("initDelivery: using Timeout.ms=%1").arg(deliveryTimeout.ms));
+
+    ybmDiag(QStringLiteral("initDelivery: calling createNode()"));
+    bool okCreate = deliveryBoolResult(m_deliveryClient->invokeRemoteMethod(
+        kDeliveryModuleName, QStringLiteral("createNode"),
+        QVariantList{ QVariant(cfgJson) }, deliveryTimeout));
+    ybmDiag(QStringLiteral("initDelivery: createNode() ok=%1").arg(okCreate));
+    if (!okCreate) {
+        m_deliveryStarting = false;
+        setStatus(QStringLiteral("Delivery init failed"));
+        emitStateChanged();
+        return;
+    }
+
+    ybmDiag(QStringLiteral("initDelivery: calling start()"));
+    bool okStart = deliveryBoolResult(m_deliveryClient->invokeRemoteMethod(
+        kDeliveryModuleName, QStringLiteral("start"),
+        QVariantList{}, deliveryTimeout));
+    ybmDiag(QStringLiteral("initDelivery: start() ok=%1").arg(okStart));
+    if (!okStart) {
+        m_deliveryStarting = false;
+        setStatus(QStringLiteral("Delivery start failed"));
+        emitStateChanged();
+        return;
+    }
+    // Prefer the connectionStateChanged event to flip ready. Fall back to
+    // polled-ready in case the event never fires (same pattern storage uses).
+    if (!m_deliveryReady) {
+        m_deliveryReady = true;
+        m_deliveryStarting = false;
+        ybmDiag(QStringLiteral("initDelivery: m_deliveryReady=true (polled)"));
+        emitStateChanged();
+    }
+}
+
+QString YoloBoardModule::threadContentTopic(const QString& parentChannelId,
+                                            const QString& parentMsgId) {
+    QByteArray src;
+    src += QByteArrayLiteral("yolo:thread:v1");
+    src += char(0);
+    src += parentChannelId.toUtf8();
+    src += char(0);
+    src += parentMsgId.toUtf8();
+    QByteArray h = QCryptographicHash::hash(src, QCryptographicHash::Sha256);
+    // Keep the topic short: 16 bytes of the hash is 2⁻⁶⁴ collision, plenty
+    // for a per-message room. Matches the chat_module /app/ver/room/encoding
+    // convention so any Waku-aware tooling recognises it.
+    return QStringLiteral("/yolo/1/thread-%1/proto")
+               .arg(QString::fromLatin1(h.left(16).toHex()));
+}
+
+void YoloBoardModule::onThreadMessageReceived(const QString& topic,
+                                              const QString& payloadB64,
+                                              quint64 tsNs) {
+    if (!m_activeThreads.contains(topic)) return;  // not listening anymore
+
+    QByteArray raw = QByteArray::fromBase64(payloadB64.toUtf8());
+    QJsonDocument doc = QJsonDocument::fromJson(raw);
+    if (!doc.isObject()) {
+        ybmDiag(QStringLiteral("thread msg: non-JSON payload on %1").arg(topic));
+        return;
+    }
+    QJsonObject obj = doc.object();
+
+    QString localId = obj.value("id").toString(
+        QUuid::createUuid().toString(QUuid::WithoutBraces));
+
+    QVariantList& buf = m_threadMessages[topic];
+    // If this is our own message echoed back through the relay, the id matches
+    // an existing local entry — flip `confirmed` so the UI can show the
+    // "delivered ✓" indicator (proves the relay accepted + propagated us).
+    for (int i = 0; i < buf.size(); ++i) {
+        QVariantMap m = buf[i].toMap();
+        if (m.value("id").toString() == localId) {
+            if (!m.value("confirmed").toBool()) {
+                m["confirmed"] = true;
+                buf[i] = m;
+                emitThreadMessagesChanged(topic);
+            }
+            return;
+        }
+    }
+
+    QVariantMap msg;
+    msg["id"]        = localId;
+    msg["text"]      = obj.value("text").toString();
+    msg["nick"]      = obj.value("nick").toString();
+    msg["ts"]        = qulonglong(obj.value("ts").toVariant().toULongLong());
+    msg["receivedAt"] = qulonglong(tsNs);
+    msg["isOwn"]     = false;
+    msg["pending"]   = false;
+    msg["failed"]    = false;
+    msg["confirmed"] = true;  // arrived from network = network-confirmed
+
+    buf.append(msg);
+    while (buf.size() > kMaxThreadMsgs) buf.removeFirst();
+    emitThreadMessagesChanged(topic);
+}
+
+// ── Participated threads persistence ─────────────────────────────────────────
+
+QString YoloBoardModule::participatedThreadsPath() const {
+    if (m_dataDir.isEmpty()) return {};
+    return m_dataDir + "/participated-threads.json";
+}
+
+void YoloBoardModule::loadParticipatedThreads() {
+    QString path = participatedThreadsPath();
+    if (path.isEmpty()) {
+        // dataDir not set yet — defer until configure runs.
+        return;
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    if (!doc.isArray()) return;
+    m_participatedThreads.clear();
+    for (const QJsonValue& v : doc.array()) {
+        if (v.isObject()) m_participatedThreads.append(v.toObject().toVariantMap());
+    }
+}
+
+void YoloBoardModule::saveParticipatedThreads() {
+    QString path = participatedThreadsPath();
+    if (path.isEmpty()) return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonArray arr;
+    for (const QVariant& v : m_participatedThreads) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void YoloBoardModule::recordParticipation(const QString& threadTopic,
+                                          const QString& parentChannelId,
+                                          const QString& parentMsgId) {
+    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    for (int i = 0; i < m_participatedThreads.size(); ++i) {
+        QVariantMap m = m_participatedThreads[i].toMap();
+        if (m.value("threadTopic").toString() == threadTopic) {
+            m["lastSeenMs"] = qlonglong(nowMs);
+            m_participatedThreads[i] = m;
+            saveParticipatedThreads();
+            return;
+        }
+    }
+    // Best-effort parent preview from in-memory cache.
+    QString preview;
+    const QVariantList& parentMsgs = m_allMessages.value(parentChannelId);
+    for (const QVariant& v : parentMsgs) {
+        QVariantMap m = v.toMap();
+        if (m.value("id").toString() == parentMsgId) {
+            preview = m.value("displayText").toString();
+            if (preview.isEmpty()) preview = m.value("data").toString();
+            if (preview.size() > 80) preview = preview.left(80) + "…";
+            break;
+        }
+    }
+
+    QVariantMap entry;
+    entry["threadTopic"]     = threadTopic;
+    entry["parentChannelId"] = parentChannelId;
+    entry["parentMsgId"]     = parentMsgId;
+    entry["parentPreview"]   = preview;
+    entry["firstSeenMs"]     = qlonglong(nowMs);
+    entry["lastSeenMs"]      = qlonglong(nowMs);
+    m_participatedThreads.append(entry);
+    saveParticipatedThreads();
+}
+
+// ── Public API: threads ──────────────────────────────────────────────────────
+
+QString YoloBoardModule::open_thread(const QString& parentChannelId,
+                                     const QString& parentMsgId) {
+    if (parentChannelId.isEmpty() || parentMsgId.isEmpty())
+        return QStringLiteral("Error: missing parent ids");
+    QString topic = threadContentTopic(parentChannelId, parentMsgId);
+    if (!m_deliveryClient) return QStringLiteral("Error: delivery unavailable");
+    if (!m_deliveryReady) {
+        // Caller can retry after connectionStateChanged.
+        return QString();
+    }
+    // Defer the subscribe dispatch via a zero-delay singleShot so open_thread
+    // returns to the caller instantly. The async flavour of invokeRemoteMethod
+    // still runs `requestObject → waitForSource` synchronously on cold
+    // replicas, which can block ~20 s on the first call for a given module —
+    // that'd wedge open_thread's own Q_INVOKABLE reply and users see the
+    // panel freeze before opening.
+    // Track subscribed state so the UI can clear its "Connecting…" hint
+    // on ack rather than waiting for the first message (empty threads are
+    // legitimate; the indicator should only reflect subscribe success).
+    m_threadSubscribed.insert(topic, false);
+    ybmDiag(QStringLiteral("open_thread: dispatching subscribe topic=%1").arg(topic));
+    LogosAPIClient* deliveryClient = m_deliveryClient;
+    QPointer<YoloBoardModule> self(this);
+    QTimer::singleShot(0, this, [deliveryClient, topic, self]() {
+        deliveryClient->invokeRemoteMethodAsync(
+            kDeliveryModuleName, QStringLiteral("subscribe"),
+            QVariantList{ QVariant(topic) },
+            [topic, self](const QVariant& r) {
+                bool ok = r.canConvert<LogosResult>() && r.value<LogosResult>().success;
+                ybmDiag(QStringLiteral("open_thread: subscribe done topic=%1 ok=%2").arg(topic).arg(ok));
+                if (!self) return;
+                if (ok) self->m_threadSubscribed.insert(topic, true);
+                self->emitThreadMessagesChanged(topic);  // nudge UI to poll
+            },
+            Timeout{60000});
+    });
+
+    QVariantMap meta;
+    meta["parentChannelId"] = parentChannelId;
+    meta["parentMsgId"]     = parentMsgId;
+    m_activeThreads.insert(topic, meta);
+    if (!m_threadMessages.contains(topic)) m_threadMessages.insert(topic, {});
+
+    recordParticipation(topic, parentChannelId, parentMsgId);
+    emitThreadMessagesChanged(topic);
+    return topic;
+}
+
+void YoloBoardModule::close_thread(const QString& topic) {
+    if (!m_activeThreads.contains(topic)) return;
+    m_threadSubscribed.remove(topic);
+    if (m_deliveryClient) {
+        // Defer via singleShot so close_thread returns instantly (same
+        // cold-replica latency concern as subscribe — see open_thread).
+        LogosAPIClient* deliveryClient = m_deliveryClient;
+        QTimer::singleShot(0, this, [deliveryClient, topic]() {
+            deliveryClient->invokeRemoteMethodAsync(
+                kDeliveryModuleName, QStringLiteral("unsubscribe"),
+                QVariantList{ QVariant(topic) },
+                [](const QVariant&) {},
+                Timeout{60000});
+        });
+    }
+    m_activeThreads.remove(topic);
+    // NOTE: keep m_threadMessages[topic] populated so closing + reopening
+    // the same thread restores history instantly. The buffer is bounded by
+    // kMaxThreadMsgs anyway. Cross-session persistence would be a further
+    // step (write to disk on close + reload on open_thread).
+    // Purge any pending id → topic refs so stale messageSent/Error callbacks
+    // for this room don't reach into maps that no longer exist.
+    for (auto it = m_threadPendingById.begin(); it != m_threadPendingById.end(); ) {
+        if (it.value().value("topic").toString() == topic)
+            it = m_threadPendingById.erase(it);
+        else
+            ++it;
+    }
+}
+
+QString YoloBoardModule::publish_thread_reply(const QString& topic,
+                                              const QString& text) {
+    if (text.trimmed().isEmpty()) return QStringLiteral("Error: empty message");
+    if (!m_activeThreads.contains(topic))
+        return QStringLiteral("Error: thread not open");
+    if (!m_deliveryClient || !m_deliveryReady)
+        return QStringLiteral("Error: delivery not ready");
+
+    QString localId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QString nick    = m_ownChannelId.left(8);  // short stand-in identity
+    qint64  nowMs   = QDateTime::currentMSecsSinceEpoch();
+
+    // Optimistic append — UI shows it instantly.
+    QVariantMap msg;
+    msg["id"]      = localId;
+    msg["text"]    = text;
+    msg["nick"]    = nick;
+    msg["ts"]      = qlonglong(nowMs);
+    msg["isOwn"]   = true;
+    msg["pending"] = true;
+    msg["failed"]  = false;
+    m_threadMessages[topic].append(msg);
+    while (m_threadMessages[topic].size() > kMaxThreadMsgs)
+        m_threadMessages[topic].removeFirst();
+    emitThreadMessagesChanged(topic);
+
+    // Build payload and ship it. Delivery module base64-encodes the QString
+    // payload internally before crossing the FFI boundary.
+    QJsonObject payload;
+    payload["v"]    = 1;
+    payload["id"]   = localId;
+    payload["text"] = text;
+    payload["nick"] = nick;
+    payload["ts"]   = qlonglong(nowMs);
+    QString payloadStr = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    // Defer via singleShot so publish_thread_reply returns instantly — see
+    // open_thread for the cold-replica latency rationale. The reply callback
+    // fires on main thread when the ~20 s Waku round-trip completes.
+    ybmDiag(QStringLiteral("publish_thread_reply: dispatching send topic=%1 localId=%2")
+                .arg(topic).arg(localId));
+    QPointer<YoloBoardModule> self(this);
+    LogosAPIClient* deliveryClient = m_deliveryClient;
+    QTimer::singleShot(0, this, [deliveryClient, topic, payloadStr, localId, self]() {
+      deliveryClient->invokeRemoteMethodAsync(
+        kDeliveryModuleName, QStringLiteral("send"),
+        QVariantList{ QVariant(topic), QVariant(payloadStr) },
+        [self, topic, localId](const QVariant& raw) {
+            if (!self) return;
+            bool    ok    = raw.canConvert<LogosResult>() && raw.value<LogosResult>().success;
+            QString reqId = raw.canConvert<LogosResult>()
+                                ? raw.value<LogosResult>().value.toString()
+                                : QString();
+            ybmDiag(QStringLiteral("publish_thread_reply: send done topic=%1 ok=%2 reqId=%3")
+                        .arg(topic).arg(ok).arg(reqId));
+            QVariantList& buf = self->m_threadMessages[topic];
+            for (int i = 0; i < buf.size(); ++i) {
+                QVariantMap m = buf[i].toMap();
+                if (m.value("id").toString() != localId) continue;
+                // send() already blocks until propagation (CALLBACK_TIMEOUT on
+                // delivery's side), so when we get here with ok=1 the network
+                // has already accepted the message. Flip pending=false now
+                // instead of waiting another ~5 s for the messageSent event —
+                // the user shouldn't see "sending" after the round-trip
+                // already completed.
+                m["pending"] = false;
+                m["failed"]  = !ok;
+                buf[i] = m;
+                break;
+            }
+            self->emitThreadMessagesChanged(topic);
+            if (ok && !reqId.isEmpty()) {
+                QVariantMap ref;
+                ref["topic"]      = topic;
+                ref["localMsgId"] = localId;
+                self->m_threadPendingById.insert(reqId, ref);
+            }
+        },
+        Timeout{60000});
+    });
+    return localId;
+}
+
+QString YoloBoardModule::get_thread_messages(const QString& topic) {
+    QJsonArray arr;
+    for (const QVariant& v : m_threadMessages.value(topic)) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::get_participated_threads() {
+    QJsonArray arr;
+    for (const QVariant& v : m_participatedThreads) {
+        arr.append(QJsonObject::fromVariantMap(v.toMap()));
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString YoloBoardModule::is_thread_subscribed(const QString& topic) {
+    return m_threadSubscribed.value(topic, false) ? QStringLiteral("true")
+                                                  : QStringLiteral("false");
+}
+
 // ── Public API: configure ────────────────────────────────────────────────────
 
 QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUrl) {
@@ -606,6 +1159,7 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
     m_configuring = true;
     m_sequencerStarting = true;
     m_storageStarting   = true;
+    m_deliveryStarting  = true;
     setStatus("Connecting & starting storage\u2026");
 
     // Pre-load cached messages off disk BEFORE the 40-60 s sequencer init.
@@ -688,6 +1242,20 @@ QString YoloBoardModule::configure(const QString& dataDir, const QString& nodeUr
         emitStateChanged();
     });
 
+    // Third parallel singleShot — delivery_module init. Runs in parallel
+    // with sequencer + storage via the nested-event-loop trick (QRO sync
+    // calls spin the main thread's event loop while waiting).
+    QTimer::singleShot(0, this, [this]() {
+        ybmDiag(QStringLiteral("configure: initDelivery begin"));
+        initDelivery();
+        ybmDiag(QStringLiteral("configure: initDelivery done deliveryReady=%1").arg(m_deliveryReady));
+        emitStateChanged();
+    });
+
+    // Now that dataDir is known, (re)load persisted participated-threads
+    // list. initLogos may have skipped this if dataDir wasn't set yet.
+    loadParticipatedThreads();
+
     return "pending";
 }
 
@@ -704,8 +1272,10 @@ QString YoloBoardModule::get_state() {
     QJsonObject state;
     state["connected"] = m_connected;
     state["storageReady"] = m_storageReady;
+    state["deliveryReady"] = m_deliveryReady;
     state["sequencerStarting"] = m_sequencerStarting;
     state["storageStarting"]   = m_storageStarting;
+    state["deliveryStarting"]  = m_deliveryStarting;
     state["uploading"] = m_uploading;
     state["status"] = m_status;
     state["ownChannelId"] = m_ownChannelId;
@@ -1329,6 +1899,12 @@ void YoloBoardModule::emitStatusChanged() {
 
 void YoloBoardModule::emitMediaReady(const QString& cid, const QString& path) {
     emit eventResponse("mediaReady", {cid, path});
+}
+
+void YoloBoardModule::emitThreadMessagesChanged(const QString& threadTopic) {
+    // Payload is the topic only; QML fetches get_thread_messages(topic) to
+    // pull the current buffer. Keeps the signal small even for long buffers.
+    emit eventResponse("threadMessagesChanged", {threadTopic});
 }
 
 // ── Config persistence ──────────────────────────────────────────────────────

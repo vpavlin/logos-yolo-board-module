@@ -60,6 +60,38 @@ public:
     // call is async and logs completion via the usual storage events.
     Q_INVOKABLE virtual QString connect_storage_peer(const QString& peerId,
                                                      const QString& addressesCsv) = 0;
+
+    // Per-message "troll box" threads. Derives a stable Waku content topic
+    // from (parentChannelId, parentMsgId) and subscribes via delivery_module.
+    // The topic is stable — anyone calling open_thread with the same inputs
+    // joins the same room. Returns the derived topic on success, empty on
+    // "delivery not ready yet" (UI shows connecting state).
+    Q_INVOKABLE virtual QString open_thread(const QString& parentChannelId,
+                                            const QString& parentMsgId) = 0;
+
+    // Unsubscribes the thread; drops buffered messages.
+    Q_INVOKABLE virtual void close_thread(const QString& threadContentTopic) = 0;
+
+    // Publishes a reply to an open thread. Returns a local pending message
+    // id on success, "Error:..." otherwise. The message is added to the
+    // thread buffer optimistically; delivery_module's messageSent /
+    // messageError events will flip pending/failed flags.
+    Q_INVOKABLE virtual QString publish_thread_reply(const QString& threadContentTopic,
+                                                     const QString& text) = 0;
+
+    // JSON array of the currently-buffered messages in the given thread.
+    // Each entry: { id, text, nick, ts, isOwn, pending, failed }.
+    Q_INVOKABLE virtual QString get_thread_messages(const QString& threadContentTopic) = 0;
+
+    // JSON array of { threadTopic, parentChannelId, parentMsgId, parentPreview,
+    // firstSeenMs, lastSeenMs }. Persisted across restarts, but threads are
+    // NOT auto-resubscribed — the user must open_thread again to rejoin.
+    Q_INVOKABLE virtual QString get_participated_threads() = 0;
+
+    // "true" once the delivery subscribe for the given topic has been
+    // confirmed by the relay, "false" otherwise. UI uses this to clear a
+    // "Connecting to relay…" indicator in the thread panel.
+    Q_INVOKABLE virtual QString is_thread_subscribed(const QString& threadContentTopic) = 0;
 };
 #define IYoloBoardModule_iid "org.logos.iyoloboardmodule"
 Q_DECLARE_INTERFACE(IYoloBoardModule, IYoloBoardModule_iid)
