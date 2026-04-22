@@ -17,7 +17,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     logos-delivery-module = {
-      url = "github:logos-co/logos-delivery-module";
+      url = "github:logos-co/logos-delivery-module/1.1.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     logos-package = {
