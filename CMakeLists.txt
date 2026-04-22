@@ -25,6 +25,11 @@ if(LOGOS_STORAGE_ROOT AND EXISTS "${LOGOS_STORAGE_ROOT}/include/storage_module_a
     )
 endif()
 
+# delivery_module is consumed via raw LogosAPIClient::invokeRemoteMethod
+# (no typed wrapper) — its current impl class shape conflicts with the
+# universal-mode generator. Once that's refactored upstream, revive the
+# typed-wrapper pattern here (mirror the storage block above).
+
 set_property(TARGET ${PLUGIN_TARGET} PROPERTY PUBLIC_HEADER
     ${CMAKE_CURRENT_SOURCE_DIR}/src/i_yolo_board_module.h
 )
@@ -50,6 +55,10 @@ if(LOGOS_STORAGE_ROOT)
         ${LOGOS_STORAGE_ROOT}/include
     )
 endif()
+
+# No delivery include — see comment above. The module is reached entirely
+# through the generic logos_sdk (LogosAPI / LogosAPIClient / LogosObject)
+# headers already pulled via LOGOS_CPP_SDK_ROOT.
 
 if(LOGOS_CPP_SDK_ROOT)
     target_link_libraries(${PLUGIN_TARGET} PRIVATE

@@ -5,5 +5,5 @@
   "type": "core",
   "category": "social",
   "main": "yolo_board_module",
-  "dependencies": ["liblogos_zone_sequencer_module", "storage_module"]
+  "dependencies": ["liblogos_zone_sequencer_module", "storage_module", "delivery_module"]
 }
