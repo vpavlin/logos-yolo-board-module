@@ -101,6 +101,12 @@ private:
     void loadParticipatedThreads();
     void saveParticipatedThreads();
     QString participatedThreadsPath() const;
+    // Per-topic message cache so closing + reopening a thread restores
+    // recent history instead of showing an empty panel. Survives app
+    // restart. Bounded by kMaxThreadMsgs per topic on in-memory side.
+    QString threadMessagesPath(const QString& topic) const;
+    void    loadThreadMessages(const QString& topic);
+    void    saveThreadMessages(const QString& topic);
     // Populate m_storagePeerId / m_storageSpr / addrs via storage_module.debug().
     void refreshStorageInfo();
     // storageUploadDone event handler completes the two-step publish flow
@@ -141,8 +147,11 @@ private:
     void runUpload(const QString& text, const QString& filePath, const QString& pendingMsgId);
     void runDownload(const QString& cid);
 
-    // Backfill
-    void runBackfill(const QString& channelId, std::shared_ptr<std::atomic<bool>> cancelled);
+    // Backfill — main-thread state machine. Each call consumes one page
+    // from zone-sequencer and either reschedules itself or finalizes.
+    void stepBackfill(const QString& channelId,
+                      const QString& cursorJson,
+                      std::shared_ptr<std::atomic<bool>> cancelled);
 
     // Events
     void emitStateChanged();
