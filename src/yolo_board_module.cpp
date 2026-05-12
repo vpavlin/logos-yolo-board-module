@@ -194,7 +194,7 @@ QVariantMap YoloBoardModule::parseMessagePayload(const QString& data) {
     if (!doc.isObject())
         return {{"text", data}, {"media", QVariantList{}}};
     QJsonObject obj = doc.object();
-    if (!obj.contains("v"))
+    if (!obj.contains("v") && !obj.contains("text") && !obj.contains("media"))
         return {{"text", data}, {"media", QVariantList{}}};
 
     QVariantMap result;
